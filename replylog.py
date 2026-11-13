@@ -117,6 +117,7 @@ def main():
     r.add_argument("--target-ts", required=True)
     r.add_argument("--sent-ts", required=True)
     r.add_argument("--thread-ts")
+    r.add_argument("--text")
     p = sub.add_parser("prune")
     p.add_argument("--older-than-days", type=int, default=DEFAULT_RETENTION_DAYS)
     p.add_argument("--dry-run", action="store_true")
@@ -143,6 +144,11 @@ def main():
         "sent_ts": args.sent_ts,
         "thread_ts": args.thread_ts,
     }
+    # Optional sent text (added 2026-11-14, answering Yama's question):
+    # storing what was actually sent makes later incidents provable
+    # from local records instead of the live thread only.
+    if getattr(args, "text", None) is not None:
+        rec["text"] = args.text
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")

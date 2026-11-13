@@ -30,6 +30,7 @@ cso = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cso)
 ORIG_LAST = cso.channel_last_yanayana_texts  # real fn; setup() stubs it
 ORIG_SENT = cso.already_sent  # real fn; some tests stub it
+ORIG_READ = cso.channel_read_page_retry  # real fn; setup() restores it
 
 CHECKS = [0, 0]  # [passed, failed]
 
@@ -53,6 +54,10 @@ def setup(tmp, name):
     cso.EVENTS = sub
     cso.already_sent = ORIG_SENT
     cso.channel_last_yanayana_texts = lambda *a, **k: []
+    # The other-author duplicate check reads the channel itself, so
+    # stub that read too: an empty page means "no other author has
+    # this text". Tests that exercise the real read restore ORIG_READ.
+    cso.channel_read_page_retry = lambda *a, **k: {"messages": []}
     cso.send = lambda *a, **k: "444.4"
 
 
@@ -169,6 +174,60 @@ def test_send_lost_reads_fail(tmp):
           read_jsonl(cso.POSTS) == [])
 
 
+def test_duplicate_of_other_blocks(tmp):
+    """Other author's identical text in last 50 -> exit 4, no send.
+
+    Parroting guard for parent posts (2026-11-14, from Yama's
+    question in #slack-へようこそ): the thread side already had it,
+    the channel side only looked at Yanayana's own posts.
+    """
+    setup(tmp, "dup_other")
+    page = {"messages": [{"user": "UOTHER", "text": MSG, "ts": "111.1"},
+                         {"user": cso.YANAYANA_USER, "text": "mine"}]}
+    cso.channel_read_page_retry = lambda *a, **k: page
+    sent = []
+    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    rc = cso.main(list(ARGS))
+    check("duplicate of other author -> exit 4", rc == 4, f"rc={rc}")
+    check("duplicate of other author -> no send attempted", sent == [])
+    check("duplicate of other author -> no record written",
+          read_jsonl(cso.POSTS) == [])
+    check("duplicate of other author -> no ambiguous record",
+          read_jsonl(cso.AMBIGUOUS) == [])
+
+
+def test_duplicate_of_other_scope(tmp):
+    """Other-author check skips Yanayana's own posts, ignores
+    different text, and matches after stripping whitespace."""
+    setup(tmp, "dup_other_scope")
+    page = {"messages": [{"user": cso.YANAYANA_USER, "text": MSG, "ts": "111.1"},
+                         {"user": "UOTHER", "text": "something else"}]}
+    cso.channel_read_page_retry = lambda *a, **k: page
+    check("other-author check skips own identical text",
+          cso.channel_duplicate_of_other("C0TEST", MSG) is None)
+    check("other-author check ignores different text",
+          cso.channel_duplicate_of_other("C0TEST", "brand new") is None)
+    page2 = {"messages": [{"user": "UOTHER", "text": "  " + MSG + "\n",
+                           "ts": "222.2"}]}
+    cso.channel_read_page_retry = lambda *a, **k: page2
+    check("other-author check strips whitespace",
+          cso.channel_duplicate_of_other("C0TEST", MSG) == "222.2")
+
+
+def test_duplicate_check_read_failure(tmp):
+    """Other-author check read fails -> exit 2, no blind send."""
+    setup(tmp, "dup_read_fail")
+    cso.channel_read_page_retry = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("read failed"))
+    sent = []
+    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    rc = cso.main(list(ARGS))
+    check("duplicate check read fails -> exit 2", rc == 2, f"rc={rc}")
+    check("duplicate check read fails -> no send attempted", sent == [])
+    check("duplicate check read fails -> no record written",
+          read_jsonl(cso.POSTS) == [])
+
+
 def test_single_call_latest_50(tmp):
     """One read with --limit 50 is the whole bounded window.
 
@@ -179,6 +238,7 @@ def test_single_call_latest_50(tmp):
     """
     setup(tmp, "single_call")
     cso.channel_last_yanayana_texts = ORIG_LAST  # test the real fn
+    cso.channel_read_page_retry = ORIG_READ  # test the real read fn
     page = {"messages": [{"user": cso.YANAYANA_USER, "text": "mine-1"},
                          {"user": "UOTHER", "text": "not-mine"},
                          {"user": cso.YANAYANA_USER, "text": "mine-2"}],
@@ -224,6 +284,9 @@ def main():
         test_send_lost_post_found(tmp)
         test_send_lost_post_absent(tmp)
         test_send_lost_reads_fail(tmp)
+        test_duplicate_of_other_blocks(tmp)
+        test_duplicate_of_other_scope(tmp)
+        test_duplicate_check_read_failure(tmp)
         test_single_call_latest_50(tmp)
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 0 if CHECKS[1] == 0 else 1

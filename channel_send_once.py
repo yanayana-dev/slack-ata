@@ -20,6 +20,16 @@ helper closes that gap, mirroring Neiro's design:
     returned nothing. The earlier 20-page oldest-first scan was
     unnecessary; "oldest-first" is only the order inside the
     returned page, not the window.)
+  * The same live-channel read is also compared against other
+    authors' posts: if the outgoing text is identical to another
+    author's recent post, refuse to send (parroting guard, exit 4).
+    This mirrors reply_once.py's duplicate_of_other for thread
+    replies (incident 2026-11-14, where a reply went out identical
+    to Yama's post from 21 seconds earlier). Extended to parent
+    posts 2026-11-14 from Yama's question in #slack-へようこそ:
+    their check was own-replies-only too, and the incident showed
+    the draft path can pick up another author's text, so own-only
+    is not enough on either side.
   * If the history read fails after retries, refuse to send blind
     (cannot-verify, exit 2). This is where we differ from Neiro on
     purpose: they keep fail-open ("a stuck reply is worse"), we keep
@@ -50,6 +60,9 @@ record exists to fall back on (refuses to send blind);
 recovery confirmation could not prove delivery -- the outcome is
 recorded and the caller must not repost blindly (a later attempt's
 pre-send check decides from the live channel / record).
+4 = duplicate-text: the outgoing message is identical to another
+author's existing post in the channel (parroting guard, added
+2026-11-14); nothing was sent.
 """
 import json
 import os
@@ -203,6 +216,32 @@ def channel_last_yanayana_texts(channel):
             if m.get("user") == YANAYANA_USER]
 
 
+def channel_duplicate_of_other(channel, message):
+    """Ts of another author's channel message whose text is identical
+    to the outgoing message, else None.
+
+    Parroting guard for parent posts, mirroring reply_once.py's
+    duplicate_of_other (incident 2026-11-14): a reply went out
+    identical to Yama's post from 21 seconds earlier, because the
+    draft path had picked up the newest post's text. The thread
+    side already compares the outgoing text against other authors'
+    posts, but this channel side only looked at Yanayana's own
+    posts, so the same accident could still go out as a parent
+    post. The comparison is exact after stripping surrounding
+    whitespace, over the latest BOUNDED channel messages.
+    """
+    if not message or not message.strip():
+        return None
+    wanted = message.strip()
+    data = channel_read_page_retry(channel)
+    for m in data.get("messages", []):
+        if m.get("user") == YANAYANA_USER:
+            continue
+        if (m.get("text") or "").strip() == wanted:
+            return m.get("ts")
+    return None
+
+
 def recovery_check(channel, message, attempts=3):
     """After a lost send response, re-read the channel to see whether
     the post actually landed. Returns True (found), False (reads
@@ -318,6 +357,20 @@ def main(argv):
     if check_only:
         print("not-sent")
         return 0
+
+    try:
+        dup_ts = channel_duplicate_of_other(channel, message)
+    except Exception as e:
+        # Same fail-closed stance as the already-sent check: when
+        # the channel cannot be read, do not send blind.
+        print(f"cannot-verify: duplicate-text check failed ({e}); "
+              "refusing to send", file=sys.stderr)
+        return 2
+    if dup_ts:
+        print(f"duplicate-text: outgoing message is identical to "
+              f"another author's post ({dup_ts}); refusing to send",
+              file=sys.stderr)
+        return 4
 
     post_ts = None
     try:
