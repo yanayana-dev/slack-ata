@@ -33,7 +33,10 @@ record exists to fall back on (refuses to send blind);
 3 = ambiguous_post_outcome: the send response was lost and the
 recovery confirmation could not prove delivery -- the outcome is
 recorded and the caller must not repost blindly (a later attempt's
-pre-send check decides from the live thread / record).
+pre-send check decides from the live thread / record);
+4 = duplicate-text: the outgoing message is identical to another
+author's existing post in the thread (parroting guard, added
+2026-11-14); nothing was sent.
 """
 import fcntl
 import json
@@ -133,13 +136,9 @@ def thread_read_page_retry(channel, thread_ts, oldest=None, attempts=5):
     raise last_exc
 
 
-def thread_yanayana_replies(channel, thread_ts):
-    """(ts, text) of Yanayana's replies in the live thread, all pages.
-
-    The parent message itself (ts == thread_ts) does not count, so this
-    also works for threads Yanayana started.
-    """
-    replies = []
+def thread_all_messages(channel, thread_ts):
+    """All messages in the live thread, all pages, oldest first."""
+    messages = []
     # Start paging at the parent ts: without --oldest the first page is
     # the parent plus the *latest* replies, and next_oldest then points
     # at the newest message, so later pages come back empty and older
@@ -148,9 +147,7 @@ def thread_yanayana_replies(channel, thread_ts):
     oldest = thread_ts
     for page in range(20):  # safety cap: 20 pages x 100 messages
         data = thread_read_page_retry(channel, thread_ts, oldest)
-        replies.extend({"ts": m.get("ts"), "text": m.get("text") or ""}
-                       for m in data.get("messages", [])
-                       if m.get("user") == YANAYANA_USER and m.get("ts") != thread_ts)
+        messages.extend(data.get("messages", []))
         if not data.get("has_more"):
             break
         nxt = data.get("next_oldest")
@@ -166,7 +163,42 @@ def thread_yanayana_replies(channel, thread_ts):
         print("warning: thread scan stopped at 20-page cap; "
               "thread may have more messages unchecked",
               file=sys.stderr)
-    return replies
+    return messages
+
+
+def thread_yanayana_replies(channel, thread_ts):
+    """(ts, text) of Yanayana's replies in the live thread, all pages.
+
+    The parent message itself (ts == thread_ts) does not count, so this
+    also works for threads Yanayana started.
+    """
+    return [{"ts": m.get("ts"), "text": m.get("text") or ""}
+            for m in thread_all_messages(channel, thread_ts)
+            if m.get("user") == YANAYANA_USER and m.get("ts") != thread_ts]
+
+
+def duplicate_of_other(channel, thread_ts, message):
+    """Ts of another author's thread message whose text is identical
+    to the outgoing message, else None.
+
+    Guards against parroting (incident 2026-11-14): a reply went out
+    identical to Yama's post from 21 seconds earlier, because the
+    draft path had picked up the newest post's text while a reply to
+    an earlier message was being composed. The existing dedupe only
+    watches for sending twice to the same target; it never compared
+    the outgoing text against other authors' posts. The comparison is
+    exact after stripping surrounding whitespace, and the parent
+    message counts too (echoing the question back is not a reply).
+    """
+    if not message or not message.strip():
+        return None
+    wanted = message.strip()
+    for m in thread_all_messages(channel, thread_ts):
+        if m.get("user") == YANAYANA_USER:
+            continue
+        if (m.get("text") or "").strip() == wanted:
+            return m.get("ts")
+    return None
 
 
 def thread_yanayana_texts(channel, thread_ts):
@@ -235,14 +267,23 @@ def _append_jsonl(path, record):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False):
-    _append_jsonl(REPLIED, {
+def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False,
+                 message=None):
+    # The sent text is stored (added 2026-11-14, answering Yama's
+    # question in #slack-へようこそ): until now the record kept only
+    # ts values, so a later incident could only be reconstructed from
+    # the live thread, not from local records. With the text in the
+    # ledger, what was actually sent is provable offline.
+    entry = {
         "thread_ts": thread_ts, "reply_ts": reply_ts,
         "channel": channel,
         "target_ts": target_ts, "in_reply_to_event": target_ts,
         "recovered": recovered,
         "at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if message is not None:
+        entry["text"] = message
+    _append_jsonl(REPLIED, entry)
 
 
 def load_ambiguous():
@@ -387,7 +428,8 @@ def main(argv):
                     for r in thread_yanayana_replies(channel, thread_ts):
                         if r["text"] == message:
                             record_reply(channel, thread_ts, target_ts,
-                                         r["ts"], recovered=True)
+                                         r["ts"], recovered=True,
+                                         message=r["text"])
                             break
                 except Exception as e:
                     print(f"warning: could not record thread-found reply ({e})",
@@ -397,6 +439,20 @@ def main(argv):
     if check_only:
         print("not-replied")
         return 0
+
+    try:
+        dup_ts = duplicate_of_other(channel, thread_ts, message)
+    except Exception as e:
+        # Same fail-closed stance as the already-replied check: when
+        # the thread cannot be read, do not send blind.
+        print(f"cannot-verify: duplicate-text check failed ({e}); "
+              "refusing to send", file=sys.stderr)
+        return 2
+    if dup_ts:
+        print(f"duplicate-text: outgoing message is identical to "
+              f"another author's post ({dup_ts}); refusing to send",
+              file=sys.stderr)
+        return 4
 
     reply_ts = None
     try:
@@ -408,7 +464,8 @@ def main(argv):
               file=sys.stderr)
         outcome = recovery_check(channel, thread_ts, message)
         if outcome:
-            record_reply(channel, thread_ts, target_ts, outcome, recovered=True)
+            record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
+                         message=message)
             print("sent (recovered: reply found in thread after lost send response)")
             return 0
         reason = ("send-response-lost; recovery check could not verify delivery"
@@ -424,7 +481,8 @@ def main(argv):
               file=sys.stderr)
         outcome = recovery_check(channel, thread_ts, message)
         if outcome:
-            record_reply(channel, thread_ts, target_ts, outcome, recovered=True)
+            record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
+                         message=message)
             print("sent (recovered: reply found in thread, send gave no ts)")
             return 0
         reason = ("send gave no ts; recovery check could not verify delivery"
@@ -434,7 +492,7 @@ def main(argv):
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
-    record_reply(channel, thread_ts, target_ts, reply_ts)
+    record_reply(channel, thread_ts, target_ts, reply_ts, message=message)
     print(f"sent reply_ts={reply_ts}")
     return 0
 

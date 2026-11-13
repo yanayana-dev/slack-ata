@@ -48,6 +48,11 @@ def setup(tmp, name):
     ro.AMBIGUOUS = os.path.join(sub, "ambiguous_posts.jsonl")
     ro.EVENTS = sub
     ro.already_replied = lambda *a, **k: None
+    # The duplicate-text guard (2026-11-14) scans the raw thread via
+    # thread_all_messages; default it to an empty thread so these
+    # recovery cases are not blocked by it. The guard itself is
+    # covered by test_reply_once_duplicate_text.py.
+    ro.thread_all_messages = lambda *a, **k: []
 
 
 def read_jsonl(path):
