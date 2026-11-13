@@ -35,6 +35,7 @@ recovery confirmation could not prove delivery -- the outcome is
 recorded and the caller must not repost blindly (a later attempt's
 pre-send check decides from the live thread / record).
 """
+import fcntl
 import json
 import os
 import subprocess
@@ -219,16 +220,29 @@ def recovery_check(channel, thread_ts, message, attempts=5):
     return None
 
 
-def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False):
+def _append_jsonl(path, record):
+    """Append one JSON line, serialized with flock like msgstate.py
+    (adopted 2026-11-14 from Neiro's review of the published code:
+    plain O_APPEND is nearly safe for short lines, but two processes
+    appending at once can still interleave)."""
     os.makedirs(EVENTS, exist_ok=True)
-    with open(REPLIED, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "thread_ts": thread_ts, "reply_ts": reply_ts,
-            "channel": channel,
-            "target_ts": target_ts, "in_reply_to_event": target_ts,
-            "recovered": recovered,
-            "at": datetime.now(timezone.utc).isoformat(),
-        }, ensure_ascii=False) + "\n")
+    with open(path, "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False):
+    _append_jsonl(REPLIED, {
+        "thread_ts": thread_ts, "reply_ts": reply_ts,
+        "channel": channel,
+        "target_ts": target_ts, "in_reply_to_event": target_ts,
+        "recovered": recovered,
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def load_ambiguous():
@@ -262,16 +276,14 @@ def resolve_ambiguous(channel, thread_ts, target_ts):
                and e.get("target_ts") == target_ts]
     if not unresolved or already:
         return False
-    os.makedirs(EVENTS, exist_ok=True)
-    with open(AMBIGUOUS, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "outcome": "resolved_by_thread_check",
-            "thread_ts": thread_ts, "target_ts": target_ts,
-            "channel": channel,
-            "note": ("reply found in thread on a later pre-send check; "
-                     "the earlier ambiguous_post_outcome record was wrong"),
-            "at": datetime.now(timezone.utc).isoformat(),
-        }, ensure_ascii=False) + "\n")
+    _append_jsonl(AMBIGUOUS, {
+        "outcome": "resolved_by_thread_check",
+        "thread_ts": thread_ts, "target_ts": target_ts,
+        "channel": channel,
+        "note": ("reply found in thread on a later pre-send check; "
+                 "the earlier ambiguous_post_outcome record was wrong"),
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
     return True
 
 
@@ -289,9 +301,7 @@ def record_ambiguous(channel, thread_ts, target_ts, reason, message=None):
     }
     if message is not None:
         entry["message"] = message
-    os.makedirs(EVENTS, exist_ok=True)
-    with open(AMBIGUOUS, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _append_jsonl(AMBIGUOUS, entry)
 
 
 def already_replied(channel, thread_ts, target_ts=None, message=None):

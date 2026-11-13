@@ -17,7 +17,10 @@ Only entries that stored the message text can be matched; older
 entries without one are skipped (listed in the summary). A thread
 read failure also leaves the entry unresolved -- delivery is never
 guessed. A found reply is never reposted; this script only corrects
-records.
+records. A match also requires the reply to be posted *after* the
+target message (msg.ts > event.ts, adopted 2026-11-14 from Yama's
+audit share): an identical-text reply from before the event must
+never be matched as this event's reply.
 
 Pending resends (DLQ resend, final form agreed with Yama and Neiro
 2026-11-13 in #slack-へようこそ): when a reply's pre-send check
@@ -27,6 +30,11 @@ agent records it here with `record` (events/pending_resends.jsonl),
 and this hourly sweep retries it:
   - readable again -> send normally, prefixed with "遅れての再送"
     plus the original failure time; the reply is recorded as sent.
+  - the original reply already landed (response lost) -> record the
+    found reply as sent (recovered), never repost. Checked BEFORE
+    answered_by_other (2026-11-14, Neiro's review): otherwise a
+    delivered reply plus someone else's answer would be given up
+    without ever reaching replied.jsonl.
   - someone else already answered (a text post after the target, by
     anyone other than the questioner and Yanayana herself) -> give up,
     record only.
@@ -52,6 +60,7 @@ Exit 0 on success (including "nothing to do" / "gated"); prints a
 JSON summary. State: events/reconcile_ambiguous.state (last run epoch).
 SLACK_LISTENER_BASE overrides the base dir (tests).
 """
+import fcntl
 import importlib.util
 import json
 import os
@@ -124,8 +133,15 @@ def load_pending_resends():
 
 def append_pending_resend(entry):
     os.makedirs(EVENTS, exist_ok=True)
+    # Serialized with flock like msgstate.py (adopted 2026-11-14 from
+    # Neiro's review): two sweeps must never interleave appends.
     with open(PENDING_RESENDS, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def latest_pending_resends():
@@ -135,6 +151,23 @@ def latest_pending_resends():
         latest[e.get("target_ts")] = e
     return {t: e for t, e in latest.items()
             if e.get("status") == "pending" and e.get("message")}
+
+
+def _is_reply_after_event(msg_ts, event_ts):
+    """True when a reply ts is after the event ts (numeric compare, string fallback).
+
+    Adopted 2026-11-14 from Yama's audit share (their指摘2, agy_full_audit_out.md):
+    without this check a reply posted *before* the event -- e.g. an
+    identical-text reply to an earlier message in the same thread --
+    could be matched as this event's reply. A reply with no ts at all
+    never matches: delivery is never guessed.
+    """
+    if msg_ts is None or event_ts is None:
+        return False
+    try:
+        return float(msg_ts) > float(event_ts)
+    except (TypeError, ValueError):
+        return str(msg_ts) > str(event_ts)
 
 
 def format_failed_at_jst(iso):
@@ -244,6 +277,30 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
             summary["details"].append({"target_ts": target_ts, "result": "given_up",
                                        "reason": "parent_deleted"})
             continue
+        # Already sent (original or prefixed text found in the thread,
+        # posted after the target)? Never repost; record the found
+        # reply instead. This check comes BEFORE answered_by_other
+        # (adopted 2026-11-14 from Neiro's review of the published
+        # code): if the original send actually landed but its response
+        # was lost, and someone else answered in the meantime, the old
+        # order gave up as answered_by_other and the delivered reply
+        # was never recorded in replied.jsonl.
+        prefixed = resend_prefix(first_failed_at) + message
+        found = next((m for m in messages
+                      if m.get("user") == YANAYANA_USER
+                      and m.get("text") in (message, prefixed)
+                      and _is_reply_after_event(m.get("ts"), target_ts)), None)
+        if found:
+            ro.record_reply(channel, thread_ts, target_ts,
+                            found.get("ts"), recovered=True)
+            append_pending_resend({**e, "status": "sent", "recovered": True,
+                                   "reply_ts": found.get("ts"),
+                                   "at": datetime.now(timezone.utc).isoformat()})
+            summary["sent"] += 1
+            summary["details"].append({"target_ts": target_ts, "result": "sent",
+                                       "reply_ts": found.get("ts"),
+                                       "recovered": True})
+            continue
         # Someone else already answered: a text post after the target,
         # by anyone other than the questioner and Yanayana herself.
         answered_by = next(
@@ -274,23 +331,6 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
             summary["given_up"] += 1
             summary["details"].append({"target_ts": target_ts, "result": "given_up",
                                        "reason": "window_expired"})
-            continue
-        prefixed = resend_prefix(first_failed_at) + message
-        # Already sent (original or prefixed text found in the thread)?
-        # Never repost; record the found reply instead.
-        found = next((m for m in messages
-                      if m.get("user") == YANAYANA_USER
-                      and m.get("text") in (message, prefixed)), None)
-        if found:
-            ro.record_reply(channel, thread_ts, target_ts,
-                            found.get("ts"), recovered=True)
-            append_pending_resend({**e, "status": "sent", "recovered": True,
-                                   "reply_ts": found.get("ts"),
-                                   "at": datetime.now(timezone.utc).isoformat()})
-            summary["sent"] += 1
-            summary["details"].append({"target_ts": target_ts, "result": "sent",
-                                       "reply_ts": found.get("ts"),
-                                       "recovered": True})
             continue
         try:
             reply_ts = send(channel, thread_ts, prefixed)
@@ -350,7 +390,9 @@ def reconcile(thread_reader=None):
                 {"target_ts": target_ts, "result": "skipped_read_failed",
                  "error": str(exc)[:200]})
             continue
-        found = next((r for r in replies if r.get("text") == message), None)
+        found = next((r for r in replies
+                      if r.get("text") == message
+                      and _is_reply_after_event(r.get("ts"), target_ts)), None)
         if found:
             ro.record_reply(e.get("channel"), e.get("thread_ts"), target_ts,
                             found.get("ts"), recovered=True)
@@ -423,9 +465,28 @@ def main(argv):
                           "next_run_in_secs": int(interval - (now - last_run_epoch()))},
                          ensure_ascii=False))
         return 0
-    summary = reconcile()
-    summary["pending_resends"] = reconcile_pending_resends()
-    save_last_run(now)
+    # Single-instance gate (adopted 2026-11-14 from Neiro's review):
+    # the last-run timestamp alone cannot stop two sweeps that start
+    # together (timer + manual run) from both passing the already-sent
+    # check and sending the same resend twice. Hold an exclusive
+    # flock for the whole sweep; a second instance exits gated.
+    os.makedirs(EVENTS, exist_ok=True)
+    lock_fd = os.open(os.path.join(EVENTS, "reconcile.lock"),
+                      os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        print(json.dumps({"gated": True, "reason": "already_running"},
+                         ensure_ascii=False))
+        return 0
+    try:
+        summary = reconcile()
+        summary["pending_resends"] = reconcile_pending_resends()
+        save_last_run(now)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
     summary["gated"] = False
     print(json.dumps(summary, ensure_ascii=False))
     return 0

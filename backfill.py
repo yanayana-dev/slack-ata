@@ -18,13 +18,20 @@ the state machine uses, so re-adding is a no-op. The listener's own
 dedupe (same seen file) also keeps it from re-admitting a backfilled
 message if Slack redelivers it.
 
-Usage: backfill.py [--limit N]
+Usage: backfill.py [--limit N] [--floor-epoch SECONDS]
 Prints a JSON summary: {"recovered": n, "checked": n, "errors": [...]}
+--floor-epoch sets the floor explicitly (epoch seconds; messages at or
+below it are skipped). Without it, an empty seen file means "first run":
+the floor defaults to now, so the first run never replays history --
+backfill only recovers messages missed during downtime, and on a first
+run there is no downtime to recover from (adopted 2026-11-14 from
+Neiro's review of the published code).
 """
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +106,13 @@ def main():
     if "--limit" in sys.argv:
         i = sys.argv.index("--limit")
         limit = sys.argv[i + 1] if i + 1 < len(sys.argv) else limit
+    floor_arg = None
+    if "--floor-epoch" in sys.argv:
+        i = sys.argv.index("--floor-epoch")
+        try:
+            floor_arg = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else None
+        except ValueError:
+            floor_arg = None
 
     seen_order = load_seen()
     seen_set = set(seen_order)
@@ -112,6 +126,15 @@ def main():
                 floor = max(floor, float(key.rsplit(":", 1)[1]))
             except ValueError:
                 pass
+    if floor_arg is not None:
+        floor = floor_arg
+    elif floor == 0.0:
+        # No seen ts keys (first run, or the seen file was lost): the
+        # old floor=0 admitted the last 100 messages wholesale. Default
+        # to now instead -- there is no downtime window to recover, so
+        # nothing is re-admitted. Pass --floor-epoch explicitly to
+        # recover from a known point in time.
+        floor = time.time()
     recovered = 0
     checked = 0
     errors = []

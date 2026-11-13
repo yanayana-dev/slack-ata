@@ -261,7 +261,48 @@ def main():
         check("duplicate record writes nothing extra", len(entries) == 1, str(entries))
 
         clear(tmp)
-        # 13. main() runs the pending sweep under the same hourly gate.
+        # 13. Same-text Yanayana reply posted BEFORE the target is not
+        # the resend: it must not count as already-sent, so the resend
+        # still goes out. (Time-order check adopted 2026-11-14 from
+        # Yama's audit share, their指摘2: msg.ts > event.ts.)
+        record(tmp, target="222.33")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "111.5", "user": YANAYANA, "text": "hello"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("pre-target same-text reply is not already-sent",
+              s["sent"] == 1 and len(sent) == 1, str(s))
+        check("resend still sent when only a pre-target reply exists",
+              status_of(tmp, "222.33") == "sent")
+
+        clear(tmp)
+        # 14. Already-sent check precedes answered_by_other (adopted
+        # 2026-11-14 from Neiro's review of the published code): the
+        # original reply landed but its response was lost, and someone
+        # else answered in the meantime. The delivered reply must be
+        # recorded in replied.jsonl, not given up as answered_by_other.
+        record(tmp, target="222.34")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "333.3", "user": OTHER, "text": "I can answer that"},
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("delivered reply + other answer is recorded, not given up",
+              s["sent"] == 1 and s["given_up"] == 0 and sent == [], str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("delivered reply recorded recovered despite other answer",
+              any(r.get("target_ts") == "222.34" and r.get("recovered") is True
+                  and r.get("reply_ts") == "444.4" for r in replied),
+              str(replied))
+        check("entry marked sent, not given up",
+              status_of(tmp, "222.34") == "sent")
+
+        clear(tmp)
+        # 15. main() runs the pending sweep under the same hourly gate.
         record(tmp, target="222.32")
         ra.ro.thread_yanayana_replies = lambda c, t: []
         # Stub the live reader/sender used by main()'s defaults.
