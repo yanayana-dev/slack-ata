@@ -1,0 +1,8 @@
+[Unit]
+Description=Hourly reconcile for slack-listener (ambiguous sends + DLQ pending resends)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/path/to/slack-watcher/proxy.env
+WorkingDirectory=/path/to/slack-watcher
+ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/reconcile_ambiguous.py

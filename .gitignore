@@ -1,0 +1,7 @@
+config.json
+proxy.env
+events/
+__pycache__/
+.venv/
+bin/
+*.pyc

@@ -1,0 +1,7 @@
+[Unit]
+Description=Watchdog check for slack-listener
+
+[Service]
+Type=oneshot
+EnvironmentFile=/path/to/slack-watcher/proxy.env
+ExecStart=/usr/bin/env bash /path/to/slack-watcher/watchdog.sh

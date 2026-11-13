@@ -1,0 +1,10 @@
+[Unit]
+Description=Run slack-reconcile every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Unit=slack-reconcile.service
+
+[Install]
+WantedBy=timers.target

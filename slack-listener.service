@@ -1,0 +1,17 @@
+[Unit]
+Description=Slack Socket Mode listener for Ata (workspace example-workspace)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/path/to/slack-watcher/proxy.env
+WorkingDirectory=/path/to/slack-watcher
+ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/listener.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=15
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

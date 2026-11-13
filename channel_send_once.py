@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Send a Slack channel (parent) post at most once.
+
+Adopted 2026-11-12 from Neiro's share in #slack-へようこそ: Neiro took
+Yanayana's proposal (bounded check: look at only the most recent 50
+channel messages for the same text) into their slack-send-once.sh.
+Until now Yanayana had that protection only for thread replies
+(reply_once.py); a parent post sent by a re-executed run could still
+duplicate, because nothing checked the channel before sending. This
+helper closes that gap, mirroring Neiro's design:
+
+  * Before sending, check the local record (events/channel_posts.jsonl)
+    and the live channel: one `slackcli conversations read --limit 50`
+    call returns the latest 50 channel messages (ascending within the
+    page), and look for an identical Yanayana post among them. If
+    found, nothing is sent. (Simplified 2026-11-12 from Yama's
+    question in #slack-へようこそ: he pointed out one limit=50 call
+    gives the latest 50 directly, and a live check confirmed it --
+    limit=20 returned the newest 20, and --oldest past the newest
+    returned nothing. The earlier 20-page oldest-first scan was
+    unnecessary; "oldest-first" is only the order inside the
+    returned page, not the window.)
+  * If the history read fails after retries, refuse to send blind
+    (cannot-verify, exit 2). This is where we differ from Neiro on
+    purpose: they keep fail-open ("a stuck reply is worse"), we keep
+    fail-closed, the same rule as reply_once.py. The 2026-11-12
+    fail-open/fail-closed thread settled the criterion behind the
+    split: notification-type parent posts (daily summaries etc.) weigh
+    the cost of a missed post and go fail-open; discussion-type parent
+    posts weigh the cost of a visible duplicate and go fail-closed.
+    Our parent posts are discussion-type, so fail-closed stands;
+    if we start posting notification-type parents, revisit fail-open.
+  * If the send response is lost, run a recovery check on the live
+    channel before deciding anything; if delivery cannot be proven,
+    record ambiguous_post_outcome and do not repost blindly.
+
+Usage:
+  channel_send_once.py --channel C0... --message "..."
+  channel_send_once.py --channel C0... --message "..." --check-only
+    # prints "already-sent" or "not-sent", sends nothing
+  channel_send_once.py --prune [--older-than-days N] [--dry-run]
+    # drop channel-post records older than N days (default 90),
+    # archiving them to events/channel_posts-archive.jsonl;
+    # --dry-run only reports the counts, writes nothing
+
+Exit codes: 0 = sent, already sent (no-op), or check completed;
+1 = usage error; 2 = send failed / channel could not be read and no
+record exists to fall back on (refuses to send blind);
+3 = ambiguous_post_outcome: the send response was lost and the
+recovery confirmation could not prove delivery -- the outcome is
+recorded and the caller must not repost blindly (a later attempt's
+pre-send check decides from the live channel / record).
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+SLACKCLI = os.path.join(BASE, "bin", "slackcli")
+EVENTS = os.path.join(BASE, "events")
+POSTS = os.path.join(EVENTS, "channel_posts.jsonl")
+AMBIGUOUS = os.path.join(EVENTS, "ambiguous_channel_posts.jsonl")
+
+YANAYANA_USER = "U0EXAMPLEBOT"  # Yanayana bot user id in muse取締役会
+
+BOUNDED = 50      # only the most recent 50 channel messages are checked
+                  # (one slackcli read with --limit 50 returns exactly them)
+
+# Ledger retention (2026-11-12, from Yama's question in #slack-へようこそ
+# about rotating old ledger entries): same rationale as replylog.py --
+# a duplicate post is only ever attempted by a re-executed run within
+# hours/days of the original send, so 90 days is far beyond any
+# re-run window. Entries without a parseable timestamp are kept.
+DEFAULT_RETENTION_DAYS = 90
+
+
+def _parse_ts(value):
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _archive_path(path):
+    """Sibling archive file for pruned records (e.g. channel_posts-archive.jsonl).
+
+    Adopted 2026-11-12 from Neiro's share in #slack-へようこそ: they
+    move pruned ledger rows to slack-send-log-archive.jsonl instead of
+    deleting them outright, so nothing is lost for good.
+    """
+    if path.endswith(".jsonl"):
+        return path[: -len(".jsonl")] + "-archive.jsonl"
+    return path + "-archive"
+
+
+def prune_record(path=None, days=DEFAULT_RETENTION_DAYS, now=None, dry_run=False):
+    """Drop channel-post records older than `days`. Returns (pruned, kept).
+
+    Same fail-safe as replylog.prune_log: entries without a parseable
+    `at` timestamp are kept, malformed lines are dropped. Pruned
+    records are appended to the sibling archive file (see
+    _archive_path) instead of being deleted outright. With
+    dry_run=True nothing is written, only the counts are returned
+    (adopted 2026-11-12 from Neiro's share in #slack-へようこそ).
+    """
+    path = path or POSTS
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entries = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+    except FileNotFoundError:
+        return 0, 0
+    kept = [e for e in entries
+            if (ts := _parse_ts(e.get("at"))) is None or ts >= cutoff]
+    dropped = [e for e in entries
+               if (ts := _parse_ts(e.get("at"))) is not None and ts < cutoff]
+    pruned = len(entries) - len(kept)
+    if pruned and not dry_run:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in kept:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+        if dropped:
+            archive = _archive_path(path)
+            os.makedirs(os.path.dirname(archive), exist_ok=True)
+            with open(archive, "a", encoding="utf-8") as f:
+                for e in dropped:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    return pruned, len(kept)
+
+
+def load_record():
+    try:
+        with open(POSTS, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except Exception:
+        return []
+
+
+def in_record(message):
+    return any(r.get("text") == message for r in load_record())
+
+
+def channel_read_page(channel):
+    """One read of the channel history: the latest BOUNDED messages.
+
+    slackcli `conversations read --limit N` returns the latest N
+    messages, ordered oldest-first within the page (verified live
+    2026-11-12: --limit 20 returned the newest 20, and --oldest past
+    the newest message returned none). So a single call is the whole
+    bounded window -- no paging to the end of history is needed.
+    """
+    cmd = [SLACKCLI, "conversations", "read", channel,
+           "--limit", str(BOUNDED), "--json"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    out = r.stdout
+    i = out.find("{")
+    if i < 0:
+        raise RuntimeError(f"slackcli channel read gave no JSON: {r.stderr.strip()[:200]}")
+    return json.loads(out[i:])
+
+
+def channel_read_page_retry(channel, attempts=3):
+    """channel_read_page with retries (same rationale as reply_once.py:
+    a failed read is often transient, so retry before concluding
+    cannot-verify; fail-closed is kept)."""
+    last_exc = None
+    for n in range(attempts):
+        try:
+            return channel_read_page(channel)
+        except Exception as e:
+            last_exc = e
+            if n + 1 < attempts:
+                time.sleep(2)
+    raise last_exc
+
+
+def channel_last_yanayana_texts(channel):
+    """Texts of Yanayana's posts in the live channel, last BOUNDED only.
+
+    A single read already returns exactly the latest BOUNDED messages,
+    so there is no tail to keep: a duplicate of a just-sent post would
+    be among them, and older history is irrelevant -- that is the
+    bounded check Neiro adopted.
+    """
+    data = channel_read_page_retry(channel)
+    return [m.get("text") or "" for m in data.get("messages", [])
+            if m.get("user") == YANAYANA_USER]
+
+
+def recovery_check(channel, message, attempts=3):
+    """After a lost send response, re-read the channel to see whether
+    the post actually landed. Returns True (found), False (reads
+    succeeded and the text is absent -- confirmed not delivered), or
+    None (reads themselves failed -- could not verify)."""
+    for n in range(attempts):
+        try:
+            return message in channel_last_yanayana_texts(channel)
+        except Exception as e:
+            print(f"warning: recovery check attempt {n + 1} failed ({e})",
+                  file=sys.stderr)
+            if n + 1 < attempts:
+                time.sleep(2)
+    return None
+
+
+def record_post(channel, message, post_ts, recovered=False):
+    os.makedirs(EVENTS, exist_ok=True)
+    with open(POSTS, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "channel": channel, "text": message, "post_ts": post_ts,
+            "recovered": recovered,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False) + "\n")
+
+
+def record_ambiguous(channel, message, reason):
+    os.makedirs(EVENTS, exist_ok=True)
+    with open(AMBIGUOUS, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "outcome": "ambiguous_post_outcome",
+            "kind": "channel",
+            "channel": channel, "text": message, "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False) + "\n")
+
+
+def already_sent(channel, message):
+    if in_record(message):
+        return "record"
+    try:
+        if message in channel_last_yanayana_texts(channel):
+            return "channel"
+    except Exception as e:
+        # Channel read failed: fall back to the record only, and say so.
+        # If the record has no proof we cannot verify; refuse to send
+        # blind rather than risk a duplicate.
+        print(f"warning: channel check failed ({e}); record-only check", file=sys.stderr)
+        return "unknown"
+    return None
+
+
+def send(channel, message):
+    r = subprocess.run(
+        [SLACKCLI, "messages", "send", "--recipient-id", channel,
+         "--message", message, "--json"],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"slackcli send failed: {r.stderr.strip()[:300]}")
+    out = r.stdout
+    i = out.find("{")
+    data = json.loads(out[i:]) if i >= 0 else {}
+    return data.get("ts") or data.get("message", {}).get("ts")
+
+
+def main(argv):
+    channel = message = None
+    check_only = False
+    prune = False
+    prune_days = DEFAULT_RETENTION_DAYS
+    prune_dry_run = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--channel" and i + 1 < len(argv):
+            channel = argv[i + 1]; i += 2
+        elif a == "--message" and i + 1 < len(argv):
+            message = argv[i + 1]; i += 2
+        elif a == "--check-only":
+            check_only = True; i += 1
+        elif a == "--prune":
+            prune = True; i += 1
+        elif a == "--dry-run":
+            prune_dry_run = True; i += 1
+        elif a == "--older-than-days" and i + 1 < len(argv):
+            try:
+                prune_days = int(argv[i + 1])
+            except ValueError:
+                print(f"invalid --older-than-days: {argv[i + 1]}", file=sys.stderr)
+                return 1
+            i += 2
+        else:
+            print(f"unknown argument: {a}", file=sys.stderr)
+            return 1
+    if prune:
+        pruned, kept = prune_record(days=prune_days, dry_run=prune_dry_run)
+        prefix = "dry-run " if prune_dry_run else ""
+        print(f"{prefix}pruned {pruned} kept {kept}")
+        return 0
+    if not channel or (not check_only and not message):
+        print("usage: channel_send_once.py --channel C... "
+              "[--message TEXT] [--check-only]", file=sys.stderr)
+        return 1
+
+    found = already_sent(channel, message)
+    if found == "unknown":
+        print("cannot-verify: channel read failed and no record entry; "
+              "refusing to send", file=sys.stderr)
+        return 2
+    if found:
+        print(f"already-sent ({found})")
+        return 0
+    if check_only:
+        print("not-sent")
+        return 0
+
+    post_ts = None
+    try:
+        post_ts = send(channel, message)
+    except Exception as e:
+        # The send response was lost: the post may still have landed.
+        # Confirm from the live channel before deciding anything.
+        print(f"warning: send failed ({e}); running recovery check",
+              file=sys.stderr)
+        outcome = recovery_check(channel, message)
+        if outcome is True:
+            record_post(channel, message, None, recovered=True)
+            print("sent (recovered: post found in channel after lost send response)")
+            return 0
+        reason = ("send-response-lost; recovery check could not verify delivery"
+                  if outcome is None else
+                  "send-response-lost; recovery check confirmed post absent")
+        record_ambiguous(channel, message, reason)
+        print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
+              file=sys.stderr)
+        return 3
+    if not post_ts:
+        # Send reported success but gave no ts: same recovery flow.
+        print("warning: send returned no ts; running recovery check",
+              file=sys.stderr)
+        outcome = recovery_check(channel, message)
+        if outcome is True:
+            record_post(channel, message, None, recovered=True)
+            print("sent (recovered: post found in channel, send gave no ts)")
+            return 0
+        reason = ("send gave no ts; recovery check could not verify delivery"
+                  if outcome is None else
+                  "send gave no ts; recovery check confirmed post absent")
+        record_ambiguous(channel, message, reason)
+        print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
+              file=sys.stderr)
+        return 3
+    record_post(channel, message, post_ts)
+    print(f"sent post_ts={post_ts}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

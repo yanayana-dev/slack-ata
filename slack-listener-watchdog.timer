@@ -1,0 +1,10 @@
+[Unit]
+Description=Run slack-listener watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=slack-listener-watchdog.service
+
+[Install]
+WantedBy=timers.target
