@@ -41,6 +41,20 @@ identical post older than target-60s (e.g. the parent text in an old
 thread) is no longer caught; exact equality with such an old post
 cannot arise from the draft path, which copies the newest post.
 
+Yama's objection (2026-11-14, thread 1794614134.265419) stands for
+the *other* parroting vector: a bot-to-bot turn routinely takes
+longer than 60s (inference, API calls, rate-limit waits), so the
+draft can repeat Yanayana's own earlier summary when the other side
+rephrases the point -- and the other side then feeds that echo back
+in, chaining into a loop. That vector is now covered by a second
+guard, duplicate_of_own_ledger: the outgoing text is compared
+against Yanayana's own past replies recorded locally in
+events/replied.jsonl (same thread; whitespace-normalized exact
+match), so the check costs no API call and sees the whole thread
+history, not just the 60s window. Role split, as Yama proposed:
+double-send prevention reads Slack, parroting prevention reads the
+local ledger.
+
 Usage:
   reply_once.py --channel C0... --thread-ts 1794471381.083589 --message "..."
   reply_once.py --channel C0... --thread-ts 1794471381.083589 --check-only
@@ -58,6 +72,9 @@ pre-send check decides from the live thread / record);
 4 = duplicate-text: the outgoing message is identical to another
 author's existing post in the thread (parroting guard, added
 2026-11-14); nothing was sent.
+5 = duplicate-own-ledger: the outgoing message repeats Yanayana's
+own earlier reply in the same thread (local-ledger parroting guard,
+added 2026-11-14 from Yama's proposal); nothing was sent.
 """
 import fcntl
 import json
@@ -244,6 +261,50 @@ def duplicate_of_other(channel, thread_ts, message, since_ts=None):
             continue
         if (m.get("text") or "").strip() == wanted:
             return m.get("ts")
+    return None
+
+
+def normalize_text(text):
+    """Whitespace-normalized form for ledger comparison.
+
+    All runs of whitespace (spaces, newlines, tabs) collapse to a
+    single space, and the ends are stripped, so a draft that only
+    re-wraps an earlier reply still matches it. Yama's proposal
+    (2026-11-14): start from exact match after normalizing blank
+    space and line breaks.
+    """
+    return " ".join((text or "").split())
+
+
+def duplicate_of_own_ledger(thread_ts, message):
+    """Reply ts of Yanayana's own earlier reply in the same thread
+    whose text matches the outgoing message, else None.
+
+    Local-ledger parroting guard (adopted 2026-11-14 from Yama's
+    proposal in #slack-へようこそ, thread 1794614134.265419):
+    bot-to-bot turns routinely exceed the 60s window of the
+    Slack-read guard, so a draft can repeat Yanayana's own earlier
+    summary when the other side rephrases the point, and the echo
+    then chains back as the other side's input. The ledger is the
+    local record events/replied.jsonl (texts stored since 2026-11-14;
+    older records without text are skipped), so the check costs no
+    API call and sees the whole thread history. Scope is the same
+    thread, as Yama proposed; channel top-level posts are covered by
+    channel_send_once.py's own-post check over the live channel.
+    """
+    if not message or not message.strip():
+        return None
+    wanted = normalize_text(message)
+    if not wanted:
+        return None
+    for r in load_record():
+        if r.get("thread_ts") != thread_ts:
+            continue
+        text = r.get("text")
+        if not text:
+            continue
+        if normalize_text(text) == wanted:
+            return r.get("reply_ts")
     return None
 
 
@@ -555,6 +616,13 @@ def main(argv):
               f"another author's post ({dup_ts}); refusing to send",
               file=sys.stderr)
         return 4
+
+    own_ts = duplicate_of_own_ledger(thread_ts, message)
+    if own_ts:
+        print(f"duplicate-own-ledger: outgoing message repeats "
+              f"Yanayana's own earlier reply in this thread "
+              f"({own_ts}); refusing to send", file=sys.stderr)
+        return 5
 
     reply_ts = None
     try:
