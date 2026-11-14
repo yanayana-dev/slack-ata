@@ -51,8 +51,13 @@ def setup(tmp, name):
     # The duplicate-text guard (2026-11-14) scans the raw thread via
     # thread_all_messages; default it to an empty thread so these
     # recovery cases are not blocked by it. The guard itself is
-    # covered by test_reply_once_duplicate_text.py.
+    # covered by test_reply_once_duplicate_text.py. Its send-time
+    # latest-page re-check (2026-11-14, Neiro's share) reads via
+    # thread_latest_page, so stub that to an empty page too -- the
+    # re-check itself is covered by
+    # test_reply_once_latest_page.py.
     ro.thread_all_messages = lambda *a, **k: []
+    ro.thread_latest_page = lambda *a, **k: {"messages": []}
 
 
 def read_jsonl(path):

@@ -123,6 +123,18 @@ def main():
               any(e.get("outcome") == "resolved_by_thread_check" and e.get("target_ts") == "T3"
                   for e in entries), str(entries))
 
+        # 3b. Whitespace-only message text counts as no text (Yama's
+        # point 2026-11-14: `not text` does not catch " ", so it would
+        # otherwise linger unmatchable forever) -> closed_no_text.
+        write_ambiguous(tmp, [amb(target="T3b", message=" ")])
+        s = ra.reconcile(thread_reader=lambda c, t: (_ for _ in ()).throw(AssertionError("must not read")))
+        check("whitespace-only message is closed as no-text",
+              s["closed_no_text"] == 1 and s["checked"] == 0, str(s))
+        entries = read_jsonl(os.path.join(tmp, "events", "ambiguous_posts.jsonl"))
+        check("whitespace-only closed_no_text record appended",
+              any(e.get("outcome") == "closed_no_text" and e.get("target_ts") == "T3b"
+                  for e in entries), str(entries))
+
         # 4. Thread read failure -> skipped, left unresolved.
         write_ambiguous(tmp, [amb(target="T4", message="hello")])
         def boom(c, t):
@@ -186,6 +198,65 @@ def main():
               s["resolved"] == 0 and s["still_unresolved"] == 1, str(s))
         check("no new record for the reused ts",
               len(read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))) == 1)
+
+        # 10. Text compared after normalization (Yama's share
+        # 2026-11-14, slack-yama commit 2c25158): a delivered reply
+        # differing only by trailing whitespace, CRLF, or Slack
+        # escaping (&amp;) still resolves the entry.
+        write_ambiguous(tmp, [amb(target="1000.000030", message="a & b\nsecond line")])
+        s = ra.reconcile(thread_reader=lambda c, t: [
+            {"ts": "1000.000031", "text": "a &amp; b\r\nsecond line  "}])
+        check("normalized text still resolves", s["resolved"] == 1, str(s))
+        # A genuinely different text must still not resolve.
+        write_ambiguous(tmp, [amb(target="1000.000032", message="a & b")])
+        s = ra.reconcile(thread_reader=lambda c, t: [
+            {"ts": "1000.000033", "text": "a & c"}])
+        check("different text still does not resolve",
+              s["resolved"] == 0 and s["still_unresolved"] == 1, str(s))
+
+        # 11. Run log (Yama's share 2026-11-14, slack-yama commit
+        # 7188927): a sweep run appends started/finished lines and
+        # saves the latest summary; a gated run logs one gated line
+        # (Yama's question 2026-11-14: a skipped run must stay
+        # visible, not vanish like a run that never started).
+        run_log = os.path.join(tmp, "events", "reconcile_runs.jsonl")
+        last_json = os.path.join(tmp, "events", "reconcile_last.json")
+        write_ambiguous(tmp, [amb(target="1000.000040", message="hello")])
+        ra.ro.thread_yanayana_replies = lambda c, t: [{"ts": "1000.000041", "text": "hello"}]
+        rc = ra.main(["--force"])
+        check("run log written on a sweep", rc == 0 and os.path.exists(run_log), str(rc))
+        lines = read_jsonl(run_log)
+        check("run log has started + finished",
+              [l.get("event") for l in lines[-2:]] == ["started", "finished"]
+              and lines[-1].get("ok") is True, str(lines))
+        with open(last_json, encoding="utf-8") as f:
+            last = json.load(f)
+        check("latest summary saved",
+              last.get("gated") is False and last.get("resolved") == 1, str(last))
+        n_before = len(lines)
+        rc = ra.main(["--interval-secs", "3600"])
+        check("gated run logs one gated line",
+              rc == 0 and len(read_jsonl(run_log)) == n_before + 1
+              and read_jsonl(run_log)[-1].get("event") == "gated"
+              and read_jsonl(run_log)[-1].get("reason") == "interval",
+              str(read_jsonl(run_log)[-2:]))
+        # 11b. A sweep that raises still logs a finished line with
+        # ok False, and the error still propagates (exit non-zero).
+        orig_reconcile = ra.reconcile
+        def boom_reconcile(thread_reader=None):
+            raise RuntimeError("sweep down")
+        ra.reconcile = boom_reconcile
+        try:
+            ra.main(["--force"])
+            check("sweep failure propagates", False, "no exception raised")
+        except RuntimeError:
+            check("sweep failure propagates", True)
+        finally:
+            ra.reconcile = orig_reconcile
+        lines = read_jsonl(run_log)
+        check("failed sweep logs finished with ok False",
+              [l.get("event") for l in lines[-2:]] == ["started", "finished"]
+              and lines[-1].get("ok") is False, str(lines))
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 1 if CHECKS[1] else 0

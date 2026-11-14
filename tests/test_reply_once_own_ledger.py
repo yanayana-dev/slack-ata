@@ -140,6 +140,27 @@ def main():
         check("normalize_text collapses whitespace",
               ro.normalize_text("a\n  b\t c ") == "a b c")
 
+        # 8. Ledger-first order (adopted 2026-11-14 from Yama's
+        # confirmation that their ledger check is the mainline step
+        # before the history scan): when the ledger matches, the
+        # history read is not attempted at all -- even if the thread
+        # read would fail, the send is still refused (exit 5) with
+        # no API call.
+        setup(tmp, "ledger_first", [ledger_entry(THREAD_TS, "my earlier reply")])
+        reads = []
+
+        def _must_not_read(*a, **k):
+            reads.append(1)
+            raise RuntimeError("history read must not run on a ledger hit")
+
+        ro.thread_read_page_retry = _must_not_read
+        rc = ro.main(args("my earlier reply"))
+        check("ledger hit skips history read -> exit 5",
+              rc == 5, f"rc={rc}")
+        check("ledger hit skips history read -> no read attempted",
+              reads == [])
+        check("ledger hit skips history read -> not sent", SENT == [])
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 1 if CHECKS[1] else 0
 

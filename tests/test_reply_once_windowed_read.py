@@ -179,21 +179,28 @@ def test_manual_mode_reads_full_thread(tmp):
 
 def test_duplicate_of_other_windowed(tmp):
     """Parroting guard: another author's identical post 30s before
-    the target is caught; one from long before the target is outside
-    the window (documented boundary -- the draft path copies the
-    newest post, which is always inside the window)."""
+    the target is caught by the windowed read; one from long before
+    the target is outside the window but is now caught by the
+    send-time latest-page re-check (adopted 2026-11-14 from Neiro's
+    share in #slack-へようこそ) -- the old boundary where it was not
+    seen at all no longer holds. The remaining hole (identical post
+    pushed beyond the latest 100) is covered in
+    test_reply_once_latest_page.py."""
     setup(tmp, "parrot_in", [parent(),
                              msg("1970.000000", OTHER, MSG)])
     dup = ro.duplicate_of_other("C0TEST", THREAD_TS, MSG,
                                 since_ts=WINDOW_START)
     check("identical post within margin -> duplicate detected",
           dup == "1970.000000", f"dup={dup}")
-    setup(tmp, "parrot_out", [parent(),
-                              msg("1500.000000", OTHER, MSG)])
+    fake2 = setup(tmp, "parrot_out", [parent(),
+                                      msg("1500.000000", OTHER, MSG)])
     dup2 = ro.duplicate_of_other("C0TEST", THREAD_TS, MSG,
                                  since_ts=WINDOW_START)
-    check("identical post before window -> not seen (boundary)",
-          dup2 is None, f"dup2={dup2}")
+    check("identical post before window -> seen via latest-page re-check",
+          dup2 == "1500.000000", f"dup2={dup2}")
+    check("windowed read first, latest-page read second",
+          fake2.oldests == [WINDOW_START, None],
+          f"oldests={fake2.oldests}")
 
 
 def main():

@@ -8,8 +8,10 @@ target proves the reply landed, but if no later send to that target
 ever happens, the ambiguous record stands forever and the replies
 ledger keeps saying "not posted". This sweep re-checks unresolved
 ambiguous entries against the live thread on a schedule (the poll hook
-runs it; it self-gates to at most once an hour) and, when the exact
-reply text is found, records the reply (recovered) and marks the
+runs it; it self-gates to at most once an hour) and, when the reply
+text is found (compared after normalization, see _normalize_text --
+adopted 2026-11-14 from Yama's share, slack-yama commit 2c25158),
+records the reply (recovered) and marks the
 ambiguous entry resolved -- the same record-reply path a pre-send
 check uses. A reply ts consumed by one entry is never reused for
 another entry, in the same sweep or a later one (Yama's
@@ -62,6 +64,15 @@ A send failure inside the sweep leaves the entry pending for the
 next hourly pass (until the 24h window expires); delivery is never
 guessed and a found reply is never reposted.
 
+Run log (Yama's share 2026-11-14, slack-yama commit 7188927): each
+sweep appends a started/finished line to events/reconcile_runs.jsonl
+and overwrites events/reconcile_last.json with that run's summary,
+so a run cut off mid-sweep leaves a started line with no finished
+line. A gated run (interval / already running) appends one gated
+line instead, so a skipped run stays visible (Yama's question
+2026-11-14). No per-target progress is logged (results already live
+in the ledgers); log writes are best-effort and never stop the sweep.
+
 Usage:
   reconcile_ambiguous.py [--force] [--interval-secs N]
   reconcile_ambiguous.py record --channel C... --thread-ts T...
@@ -72,6 +83,7 @@ JSON summary. State: events/reconcile_ambiguous.state (last run epoch).
 SLACK_LISTENER_BASE overrides the base dir (tests).
 """
 import fcntl
+import html
 import importlib.util
 import json
 import os
@@ -181,6 +193,59 @@ def _is_reply_after_event(msg_ts, event_ts):
         return str(msg_ts) > str(event_ts)
 
 
+def _normalize_text(text):
+    """Normalize message text before comparing a stored send with a
+    thread read (Yama's share 2026-11-14, slack-yama commit 2c25158):
+    absorb whitespace / line-ending / escaping differences (e.g. a
+    trailing space, CRLF, or `&amp;` in the Slack API text) so a
+    delivered reply is not missed over a cosmetic difference. Both
+    sides are normalized, so the comparison stays symmetric; the
+    no-reuse and after-event guards still apply unchanged.
+    """
+    text = html.unescape(text or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def _log_run(event, ok=None, error=None, reason=None):
+    """Append one start/finish line for this sweep run (Yama's share
+    2026-11-14, slack-yama commit 7188927): a run cut off mid-sweep
+    leaves a started line with no finished line, so the interruption
+    itself stays visible afterwards. Gated runs (interval / already
+    running) also log one line, so a skipped run is distinguishable
+    from a run that never started (Yama's question 2026-11-14).
+    Best-effort: a log-write failure must never stop the sweep."""
+    try:
+        os.makedirs(EVENTS, exist_ok=True)
+        line = {"event": event,
+                "at": datetime.now(timezone.utc).isoformat()}
+        if ok is not None:
+            line["ok"] = ok
+        if error:
+            line["error"] = error
+        if reason:
+            line["reason"] = reason
+        with open(os.path.join(EVENTS, "reconcile_runs.jsonl"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _save_last_summary(summary):
+    """Overwrite events/reconcile_last.json with this run's summary
+    (Yama's share 2026-11-14): only the latest run's output is kept.
+    Best-effort, like _log_run."""
+    try:
+        with open(os.path.join(EVENTS, "reconcile_last.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def format_failed_at_jst(iso):
     """'2026-11-13T14:42:36+00:00' -> '2026-11-13 23:42 JST'."""
     try:
@@ -195,17 +260,20 @@ def format_failed_at_jst(iso):
 
 
 def resend_prefix(first_failed_at):
-    # Unified 3-way wording agreed 2026-11-14 (Yama's proposal, Neiro
-    # already uses the same year+JST form): "最初の試行" reads
-    # unambiguously as the first attempt, where "元の失敗時刻" could be
-    # read as the latest failure after retries.
-    return f"遅れての再送（最初の試行：{format_failed_at_jst(first_failed_at)}）\n"
+    # Unified 3-way wording, final form agreed 2026-11-14 (Yama's
+    # revert, matching the original Neiro/Yanayana wording): "元の失敗時刻"
+    # is the time the send first stalled, and a review found that
+    # looking aligned while differing slightly is the most confusing
+    # state. The interim "最初の試行" wording (used briefly on
+    # 2026-11-14 after Yama's first proposal) is kept as legacy below
+    # so a resend already sent with it is still recognised.
+    return f"遅れての再送（元の失敗時刻：{format_failed_at_jst(first_failed_at)}）\n"
 
 
 def resend_prefix_legacy(first_failed_at):
-    # Pre-agreement wording, kept so a resend already sent with the old
-    # prefix is still recognised as delivered in the thread check below.
-    return f"遅れての再送（元の失敗時刻：{format_failed_at_jst(first_failed_at)}）\n"
+    # Interim wording, kept so a resend already sent with it is still
+    # recognised as delivered in the thread check below.
+    return f"遅れての再送（最初の試行：{format_failed_at_jst(first_failed_at)}）\n"
 
 
 def record_pending_resend(channel, thread_ts, target_ts, message,
@@ -321,7 +389,9 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
         # consumed by one entry must not resolve another in this sweep.
         found = next((m for m in messages
                       if m.get("user") == YANAYANA_USER
-                      and m.get("text") in (message, prefixed, legacy_prefixed)
+                      and _normalize_text(m.get("text")) in (
+                          _normalize_text(message), _normalize_text(prefixed),
+                          _normalize_text(legacy_prefixed))
                       and m.get("ts") not in used_reply_ts
                       and _is_reply_after_event(m.get("ts"), target_ts)), None)
         if found:
@@ -433,7 +503,11 @@ def reconcile(thread_reader=None):
         if target_ts in resolved_targets or target_ts in closed_targets:
             continue
         message = e.get("message")
-        if not message:
+        # Whitespace-only counts as no text (Yama's point 2026-11-14:
+        # `not text` does not catch " ", which could otherwise linger
+        # as an unmatchable entry forever). Same strip() guard as
+        # reply_once.py / channel_send_once.py already use.
+        if not message or not message.strip():
             if ro.close_no_text(e.get("channel"), e.get("thread_ts"), target_ts):
                 summary["closed_no_text"] += 1
                 summary["details"].append({"target_ts": target_ts, "result": "closed_no_text"})
@@ -451,7 +525,7 @@ def reconcile(thread_reader=None):
                  "error": str(exc)[:200]})
             continue
         found = next((r for r in replies
-                      if r.get("text") == message
+                      if _normalize_text(r.get("text")) == _normalize_text(message)
                       and r.get("ts") not in used_reply_ts
                       and _is_reply_after_event(r.get("ts"), target_ts)), None)
         if found:
@@ -523,6 +597,7 @@ def main(argv):
             return 1
     now = time.time()
     if not force and now - last_run_epoch() < interval:
+        _log_run("gated", reason="interval")
         print(json.dumps({"gated": True,
                           "next_run_in_secs": int(interval - (now - last_run_epoch()))},
                          ensure_ascii=False))
@@ -539,17 +614,24 @@ def main(argv):
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(lock_fd)
+        _log_run("gated", reason="already_running")
         print(json.dumps({"gated": True, "reason": "already_running"},
                          ensure_ascii=False))
         return 0
+    _log_run("started")
     try:
         summary = reconcile()
         summary["pending_resends"] = reconcile_pending_resends()
         save_last_run(now)
+    except Exception as exc:
+        _log_run("finished", ok=False, error=str(exc)[:200])
+        raise
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
     summary["gated"] = False
+    _log_run("finished", ok=True)
+    _save_last_summary(summary)
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 

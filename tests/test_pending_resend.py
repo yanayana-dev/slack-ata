@@ -108,7 +108,7 @@ def main():
         check("readable again resends once", s["sent"] == 1 and s["checked"] == 1, str(s))
         check("resend carries prefix + original failure time (JST)",
               len(sent) == 1 and sent[0].startswith(
-                  "遅れての再送（最初の試行：2026-11-13 23:00 JST）\nhello"),
+                  "遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）\nhello"),
               str(sent))
         replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
         check("resent reply recorded with ts",
@@ -236,6 +236,26 @@ def main():
         check("thread-found reply recorded recovered",
               any(r.get("target_ts") == "222.29" and r.get("recovered") is True
                   and r.get("reply_ts") == "444.4" for r in replied),
+              str(replied))
+
+        clear(tmp)
+        # 10b. Already-sent check also compares after normalization
+        # (Yama's share 2026-11-14, slack-yama commit 2c25158): a
+        # delivered reply differing only by Slack escaping (&amp;)
+        # or trailing whitespace is still recognised, never reposted.
+        record(tmp, target="222.50", message="a & b")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.5", "user": YANAYANA, "text": "a &amp; b  "}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("normalized already-sent reply is not reposted",
+              s["sent"] == 1 and sent == [], str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("normalized already-sent reply recorded recovered",
+              any(r.get("target_ts") == "222.50" and r.get("recovered") is True
+                  and r.get("reply_ts") == "444.5" for r in replied),
               str(replied))
 
         clear(tmp)
@@ -388,6 +408,29 @@ def main():
               s["given_up"] == 1, str(s))
         check("long-human given-up reason recorded",
               read_jsonl(pending_path(tmp))[-1].get("reason") == "answered_by_other")
+
+        clear(tmp)
+        # 20. A resend already sent with the interim "最初の試行"
+        # wording (used briefly on 2026-11-14 before Yama's revert to
+        # "元の失敗時刻") is still recognised as delivered: recorded
+        # recovered, never reposted.
+        record(tmp, target="222.41")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA,
+                 "text": "遅れての再送（最初の試行：2026-11-13 23:00 JST）\nhello"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("interim-wording resend in thread is not reposted",
+              s["sent"] == 1 and sent == [], str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("interim-wording resend recorded recovered",
+              any(r.get("target_ts") == "222.41" and r.get("recovered") is True
+                  and r.get("reply_ts") == "444.4" for r in replied),
+              str(replied))
+        check("interim-wording entry marked sent",
+              status_of(tmp, "222.41") == "sent")
 
         clear(tmp)
         # 16. main() runs the pending sweep under the same hourly gate.

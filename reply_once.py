@@ -31,15 +31,29 @@ in the 180-reply thread this share arrived in, a full re-read was
 reply delay. The 60s margin covers clock skew and near-simultaneous
 posts. Manual posts without an event have no anchor, so they keep
 the full-thread read, as do Yama's. Fail-closed is unchanged: a
-failed read still refuses to send blind.
-Boundary: the parroting guard (duplicate_of_other) now only sees
-posts from the window onward. The realistic vector -- the draft
+failed read still refuses to send blind. The windowed read is
+further capped at one page (100 messages) from the window start,
+adopted 2026-11-14 from Yama's proposal in #slack-へようこそ
+(thread 1794583788.831849): if more than a page follows the target,
+the window is too long to verify and the reply is not sent
+(fail-closed) instead of being treated as unanswered -- a reply
+hours later to a question buried under 100+ posts would be out of
+place, and paging onward is the same unbounded-read weakness the
+window was meant to remove. The local sent-record check runs first,
+so a recorded send still blocks a duplicate without any thread read.
+Boundary: the parroting guard (duplicate_of_other) reads the window
+from target-60s onward, and -- adopted 2026-11-14 from Neiro's share
+in #slack-へようこそ (thread 1794583788.831849) -- re-checks the
+thread's latest page (one bare read: parent plus the newest ~99
+replies) right before sending. The realistic vector -- the draft
 picking up the newest post's text (incident 2026-11-14, 21s before
 the target) -- is always inside the window, because the window runs
-to now and the newest post is never older than the target. An
-identical post older than target-60s (e.g. the parent text in an old
-thread) is no longer caught; exact equality with such an old post
-cannot arise from the draft path, which copies the newest post.
+to now and the newest post is never older than the target; the
+latest-page re-check additionally catches an identical post older
+than target-60s (e.g. the parent text in an old thread, or the same
+question asked again further up) that the window cannot see. The
+remaining hole is the same as Neiro's: an identical post pushed
+beyond the latest 100 is still missed.
 
 Yama's objection (2026-11-14, thread 1794614134.265419) stands for
 the *other* parroting vector: a bot-to-bot turn routinely takes
@@ -190,13 +204,38 @@ def thread_read_page_retry(channel, thread_ts, oldest=None, attempts=5):
     raise last_exc
 
 
-def thread_all_messages(channel, thread_ts, oldest=None):
+def thread_latest_page(channel, thread_ts):
+    """The thread's latest page: the parent plus the newest ~99 replies.
+
+    A bare read (no --oldest) returns the parent plus the *latest*
+    replies -- verified live 2026-11-12 and again 2026-11-14 (a bare
+    read of the 225-reply audit thread returned the newest messages,
+    not the oldest). One page only, so the read stays bounded; used
+    by the parroting guard's send-time re-check (see
+    duplicate_of_other).
+    """
+    return thread_read_page_retry(channel, thread_ts)
+
+
+def thread_all_messages(channel, thread_ts, oldest=None, max_pages=20,
+                        fail_closed=False):
     """All messages in the live thread, all pages, oldest first.
 
     With oldest=None the scan starts at the parent ts (full thread);
     with oldest set it starts there instead -- the windowed read for
     target-mode checks (see window_start): paging still walks forward
     from the given oldest via next_oldest.
+
+    max_pages caps how many pages are read. fail_closed (used by the
+    target-mode windowed checks, adopted 2026-11-14 from Yama's
+    proposal in #slack-へようこそ, thread 1794583788.831849):
+    when the cap is hit while the thread still has more messages,
+    raise instead of returning a partial scan -- a partial scan
+    cannot prove the reply absent, and a late reply to a question
+    buried under more than a page of later posts is out of place
+    anyway, so the caller refuses to send rather than guessing.
+    Without fail_closed the old behaviour is kept (warn and return
+    the partial scan).
     """
     messages = []
     # Start paging at the parent ts: without --oldest the first page is
@@ -205,7 +244,7 @@ def thread_all_messages(channel, thread_ts, oldest=None):
     # replies are never seen. With --oldest=thread_ts the API pages
     # oldest-first and next_oldest walks forward correctly.
     oldest = oldest or thread_ts
-    for page in range(20):  # safety cap: 20 pages x 100 messages
+    for page in range(max_pages):  # safety cap: max_pages x 100 messages
         data = thread_read_page_retry(channel, thread_ts, oldest)
         messages.extend(data.get("messages", []))
         if not data.get("has_more"):
@@ -220,6 +259,10 @@ def thread_all_messages(channel, thread_ts, oldest=None):
         # missed. Adopted 2026-11-12 from Yama's share in
         # #slack-へようこそ (their agent_tools.py warns at the same
         # 20-page cutoff).
+        if fail_closed:
+            raise RuntimeError(
+                "thread scan stopped at page cap with more messages "
+                "unchecked; refusing to decide from a partial window")
         print("warning: thread scan stopped at 20-page cap; "
               "thread may have more messages unchecked",
               file=sys.stderr)
@@ -231,11 +274,30 @@ def thread_yanayana_replies(channel, thread_ts, since_ts=None):
 
     The parent message itself (ts == thread_ts) does not count, so this
     also works for threads Yanayana started. With since_ts set, only
-    replies from that ts onward are read (windowed target-mode check).
+    replies from that ts onward are read (windowed target-mode check),
+    capped at one page (100 messages) and fail-closed: if more than a
+    page follows the target, the window is too long to verify and the
+    caller refuses to send (Yama's 2026-11-14 proposal). Without
+    since_ts the full thread is read as before.
     """
+    if since_ts is None:
+        return [{"ts": m.get("ts"), "text": m.get("text") or ""}
+                for m in thread_all_messages(channel, thread_ts)
+                if m.get("user") == YANAYANA_USER and m.get("ts") != thread_ts]
     return [{"ts": m.get("ts"), "text": m.get("text") or ""}
-            for m in thread_all_messages(channel, thread_ts, oldest=since_ts)
+            for m in thread_all_messages(channel, thread_ts, oldest=since_ts,
+                                        max_pages=1, fail_closed=True)
             if m.get("user") == YANAYANA_USER and m.get("ts") != thread_ts]
+
+
+def _identical_other_post(messages, wanted):
+    """Ts of another author's message in the list identical to wanted."""
+    for m in messages:
+        if m.get("user") == YANAYANA_USER:
+            continue
+        if (m.get("text") or "").strip() == wanted:
+            return m.get("ts")
+    return None
 
 
 def duplicate_of_other(channel, thread_ts, message, since_ts=None):
@@ -252,16 +314,33 @@ def duplicate_of_other(channel, thread_ts, message, since_ts=None):
     message counts too (echoing the question back is not a reply) --
     in windowed mode only when the parent is inside the window (see
     the module docstring for the boundary).
+
+    Target mode reads the window first (one page from 60s before the
+    target, fail-closed), then re-checks the thread's latest page
+    (adopted 2026-11-14 from Neiro's share in #slack-へようこそ,
+    thread 1794583788.831849: their send-time check looks at the
+    latest 100 messages, which catches an identical post older than
+    the window that the windowed read cannot see). The remaining hole
+    is the same as theirs: an identical post pushed beyond the latest
+    100 is still missed. A failed latest-page read is fail-closed
+    like the windowed read -- the caller refuses to send blind.
     """
     if not message or not message.strip():
         return None
     wanted = message.strip()
-    for m in thread_all_messages(channel, thread_ts, oldest=since_ts):
-        if m.get("user") == YANAYANA_USER:
-            continue
-        if (m.get("text") or "").strip() == wanted:
-            return m.get("ts")
-    return None
+    if since_ts is None:
+        messages = thread_all_messages(channel, thread_ts)
+        return _identical_other_post(messages, wanted)
+    # One page, fail-closed (Yama's 2026-11-14 proposal): more
+    # than a page after the target means the window is too long
+    # to verify, so the caller refuses to send.
+    messages = thread_all_messages(channel, thread_ts, oldest=since_ts,
+                                   max_pages=1, fail_closed=True)
+    found = _identical_other_post(messages, wanted)
+    if found:
+        return found
+    latest = thread_latest_page(channel, thread_ts)
+    return _identical_other_post(latest.get("messages", []), wanted)
 
 
 def normalize_text(text):
@@ -602,6 +681,18 @@ def main(argv):
         print("not-replied")
         return 0
 
+    # Local-ledger parroting guard first: it costs no API call, so a
+    # ledger hit skips the history read below. Order adopted
+    # 2026-11-14 from Yama's confirmation (thread
+    # 1794614134.265419): their ledger check is the mainline step
+    # before the Slack history scan, not a fallback.
+    own_ts = duplicate_of_own_ledger(thread_ts, message)
+    if own_ts:
+        print(f"duplicate-own-ledger: outgoing message repeats "
+              f"Yanayana's own earlier reply in this thread "
+              f"({own_ts}); refusing to send", file=sys.stderr)
+        return 5
+
     try:
         dup_ts = duplicate_of_other(channel, thread_ts, message,
                                     since_ts=since_ts)
@@ -616,13 +707,6 @@ def main(argv):
               f"another author's post ({dup_ts}); refusing to send",
               file=sys.stderr)
         return 4
-
-    own_ts = duplicate_of_own_ledger(thread_ts, message)
-    if own_ts:
-        print(f"duplicate-own-ledger: outgoing message repeats "
-              f"Yanayana's own earlier reply in this thread "
-              f"({own_ts}); refusing to send", file=sys.stderr)
-        return 5
 
     reply_ts = None
     try:
