@@ -39,7 +39,7 @@ import post_metadata
 CHECKS = [0, 0]  # [passed, failed]
 
 FAKE_TOKEN = "xoxb-REPLACE-ME"
-CHANNEL = "C0EXAMPLE001"
+CHANNEL = "C0EXAMPLE010"
 THREAD_TS = "1000.000000"
 EVENT_ID = "Ev0TESTEVENTID1"
 REQUEST_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -230,7 +230,7 @@ def test_post_no_retry():
 def test_find_by_metadata():
     msgs = [
         _meta_msg("1000.000000", text="parent"),
-        {"ts": "1001.000000", "user": "U0OTHER", "text": "question"},
+        {"ts": "1001.000000", "user": "U0EXAMPLEOTHER", "text": "question"},
         _meta_msg("1002.000000", event_id=EVENT_ID, text="our reply"),
         _meta_msg("1003.000000", request_id=REQUEST_ID, text="manual reply"),
         _meta_msg("1004.000000", event_id=EVENT_ID, event_type="other_reply",

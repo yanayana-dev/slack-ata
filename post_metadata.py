@@ -278,13 +278,15 @@ def send_reply(channel, thread_ts, text, event_id=None, request_id=None,
 
 
 def read_thread(channel, thread_ts, token, urlopen=None, sleep=None,
-                limit=200):
+                limit=200, oldest=None):
     """All messages in a thread, oldest first, with metadata attached.
 
     conversations.replies with include_all_metadata=true, paged by
     cursor. Raises RuntimeError when a page cannot be read after the
     agreed retries (fail-closed: the caller must not decide from a
-    partial thread).
+    partial thread). With oldest set, only messages from that ts
+    onward are read (the windowed duplicate check's 60s-before-target
+    window).
     """
     messages = []
     cursor = None
@@ -295,6 +297,8 @@ def read_thread(channel, thread_ts, token, urlopen=None, sleep=None,
             "limit": str(limit),
             "include_all_metadata": "true",
         }
+        if oldest is not None:
+            params["oldest"] = str(oldest)
         if cursor:
             params["cursor"] = cursor
         query = urllib.parse.urlencode(params)
@@ -306,6 +310,22 @@ def read_thread(channel, thread_ts, token, urlopen=None, sleep=None,
         if not result.get("has_more") or not cursor:
             break
     return messages
+
+
+def stamp_event_id(message, event_type=EVENT_TYPE):
+    """event_id from our metadata stamp on a message, else None.
+
+    Only a stamp with our event_type and an event_id payload counts:
+    a request_id stamp (manual post) or another bot's stamp carries
+    no event_id for this event, so it stays a plain text candidate
+    for the caller's text check instead of being excluded.
+    """
+    meta = (message or {}).get("metadata") or {}
+    if meta.get("event_type") != event_type:
+        return None
+    payload = meta.get("event_payload") or {}
+    value = payload.get("event_id")
+    return str(value) if value is not None else None
 
 
 def find_by_metadata(messages, event_id=None, request_id=None,

@@ -13,7 +13,16 @@ text is found (compared after normalization, see _normalize_text --
 adopted 2026-11-14 from Yama's share, slack-yama commit 2c25158),
 records the reply (recovered) and marks the
 ambiguous entry resolved -- the same record-reply path a pre-send
-check uses. A reply ts consumed by one entry is never reused for
+check uses. Both the ledger entry and the correction entry carry
+the originating event_id when the ambiguous entry has one (added
+2026-11-15 from Neiro's correction in #slack-へようこそ: their
+fix keeps the mark on the correction entries too). Entries that carry an event_id are matched through a
+metadata-aware read instead (added 2026-11-15 from Yama's
+confirmation in #slack-へようこそ: their reconcile excludes replies
+stamped with a different event_id at all four matching points):
+a same-text reply stamped for another event must not resolve the
+entry; unstamped replies stay text candidates. Entries without an
+event_id keep the text-only match. A reply ts consumed by one entry is never reused for
 another entry, in the same sweep or a later one (Yama's
 assigned_reply_ts idea, adopted 2026-11-14; seeded from replied.jsonl
 per Neiro's share 2026-11-14): two entries with identical text cannot resolve
@@ -44,7 +53,13 @@ and this hourly sweep retries it:
     found reply as sent (recovered), never repost. Checked BEFORE
     answered_by_other (2026-11-14, Neiro's review): otherwise a
     delivered reply plus someone else's answer would be given up
-    without ever reaching replied.jsonl.
+    without ever reaching replied.jsonl. When the entry carries an
+    event_id, the already-sent check reads the thread with metadata
+    and drops our own replies stamped for another event (Neiro's
+    share 2026-11-15, neiro-slack-system commit 2af573d); entries
+    without one keep the text-only match, and a metadata read
+    failure leaves the entry pending (no metadata-blind fallback,
+    same stance as the ambiguous sweep).
   - someone else already answered (a text post after the target, by
     anyone other than the questioner and Yanayana herself, from a
     human -- not a bot -- with more than 10 characters of text;
@@ -77,7 +92,7 @@ Usage:
   reconcile_ambiguous.py [--force] [--interval-secs N]
   reconcile_ambiguous.py record --channel C... --thread-ts T...
       --target-ts M... --questioner U... --error-kind KIND --message TEXT
-      [--first-failed-at ISO8601]
+      [--first-failed-at ISO8601] [--event-id Ev...]
 Exit 0 on success (including "nothing to do" / "gated"); prints a
 JSON summary. State: events/reconcile_ambiguous.state (last run epoch).
 SLACK_LISTENER_BASE overrides the base dir (tests).
@@ -118,6 +133,11 @@ ro.BASE = BASE
 ro.EVENTS = EVENTS
 ro.REPLIED = os.path.join(EVENTS, "replied.jsonl")
 ro.AMBIGUOUS = os.path.join(EVENTS, "ambiguous_posts.jsonl")
+
+_PM_SPEC = importlib.util.spec_from_file_location(
+    "post_metadata", os.path.join(os.path.dirname(os.path.abspath(__file__)), "post_metadata.py"))
+pm = importlib.util.module_from_spec(_PM_SPEC)
+_PM_SPEC.loader.exec_module(pm)
 
 
 def load_ambiguous():
@@ -277,7 +297,8 @@ def resend_prefix_legacy(first_failed_at):
 
 
 def record_pending_resend(channel, thread_ts, target_ts, message,
-                          questioner_user, error_kind, first_failed_at=None):
+                          questioner_user, error_kind, first_failed_at=None,
+                          event_id=None):
     """Record a pre-check failure for a later delayed resend.
 
     Raises ValueError for a non-transient error kind: only transient
@@ -285,6 +306,10 @@ def record_pending_resend(channel, thread_ts, target_ts, message,
     retries stays dead-lettered; this sweep does not rescue it).
     Raises ValueError when a pending entry for the same target already
     exists -- one held reply per target, never two.
+    event_id (optional, the originating Slack event id) is stored so
+    the sweep's already-sent check can read the thread with metadata
+    and drop our own replies stamped for another event (Neiro's share
+    2026-11-15); entries without one keep the text-only match.
     """
     if error_kind not in TRANSIENT_ERROR_KINDS:
         raise ValueError(
@@ -293,13 +318,16 @@ def record_pending_resend(channel, thread_ts, target_ts, message,
     if target_ts in latest_pending_resends():
         raise ValueError(f"a pending resend already exists for target {target_ts}")
     failed_at = first_failed_at or datetime.now(timezone.utc).isoformat()
-    append_pending_resend({
+    entry = {
         "status": "pending",
         "channel": channel, "thread_ts": thread_ts, "target_ts": target_ts,
         "message": message, "questioner_user": questioner_user,
         "error_kind": error_kind, "first_failed_at": failed_at,
         "at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if event_id is not None:
+        entry["event_id"] = event_id
+    append_pending_resend(entry)
     return failed_at
 
 
@@ -328,17 +356,23 @@ def thread_all_messages(channel, thread_ts):
     return messages
 
 
-def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
+def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
+                              metadata_reader=None):
     """One sweep over held pre-check-failure replies.
 
     thread_reader(channel, thread_ts) -> [{"ts", "user", "text"}]
     defaults to thread_all_messages (live Slack read).
     sender(channel, thread_ts, message) -> reply ts; defaults to
-    reply_once.send. Tests inject fakes, so no real Slack call is made.
+    reply_once.send. metadata_reader(channel, thread_ts, event_id) ->
+    [{"ts", "text"}] defaults to metadata_thread_replies: used for the
+    already-sent check of entries that carry an event_id, so a
+    same-text reply stamped for another event cannot resolve the
+    entry. Tests inject fakes, so no real Slack call is made.
     Returns a summary dict.
     """
     reader = thread_reader or thread_all_messages
     send = sender or ro.send
+    meta_reader = metadata_reader or metadata_thread_replies
     now_epoch = now if now is not None else time.time()
     # Reply ts consumed by one entry in this sweep (recovered or just
     # sent) must not resolve another entry: same idea as Yama's
@@ -387,17 +421,43 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
         legacy_prefixed = resend_prefix_legacy(first_failed_at) + message
         # Yama's assigned_reply_ts idea (adopted 2026-11-14): a reply ts
         # consumed by one entry must not resolve another in this sweep.
-        found = next((m for m in messages
-                      if m.get("user") == YANAYANA_USER
-                      and _normalize_text(m.get("text")) in (
-                          _normalize_text(message), _normalize_text(prefixed),
-                          _normalize_text(legacy_prefixed))
-                      and m.get("ts") not in used_reply_ts
-                      and _is_reply_after_event(m.get("ts"), target_ts)), None)
+        wanted = (_normalize_text(message), _normalize_text(prefixed),
+                  _normalize_text(legacy_prefixed))
+        if e.get("event_id"):
+            # Stamp guard (Neiro's share 2026-11-15,
+            # neiro-slack-system commit 2af573d): a same-text reply
+            # stamped for another event is that event's answer, not
+            # this resend's, so the already-sent check reads the
+            # thread with metadata and drops differently-stamped own
+            # replies (metadata_thread_replies already keeps only
+            # Yanayana's replies). A metadata read failure leaves
+            # the entry pending -- no metadata-blind fallback, the
+            # same stance as the ambiguous sweep above.
+            try:
+                meta_replies = meta_reader(channel, thread_ts,
+                                           e["event_id"])
+            except Exception as exc:
+                summary["skipped_read_failed"] += 1
+                summary["still_pending"] += 1
+                summary["details"].append(
+                    {"target_ts": target_ts, "result": "skipped_read_failed",
+                     "error": str(exc)[:200]})
+                continue
+            found = next((m for m in meta_replies
+                          if _normalize_text(m.get("text")) in wanted
+                          and m.get("ts") not in used_reply_ts
+                          and _is_reply_after_event(m.get("ts"), target_ts)), None)
+        else:
+            found = next((m for m in messages
+                          if m.get("user") == YANAYANA_USER
+                          and _normalize_text(m.get("text")) in wanted
+                          and m.get("ts") not in used_reply_ts
+                          and _is_reply_after_event(m.get("ts"), target_ts)), None)
         if found:
             used_reply_ts.add(found.get("ts"))
             ro.record_reply(channel, thread_ts, target_ts,
-                            found.get("ts"), recovered=True)
+                            found.get("ts"), recovered=True,
+                            event_id=e.get("event_id"))
             append_pending_resend({**e, "status": "sent", "recovered": True,
                                    "reply_ts": found.get("ts"),
                                    "at": datetime.now(timezone.utc).isoformat()})
@@ -457,7 +517,8 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
             continue
         if reply_ts:
             used_reply_ts.add(reply_ts)
-            ro.record_reply(channel, thread_ts, target_ts, reply_ts)
+            ro.record_reply(channel, thread_ts, target_ts, reply_ts,
+                            event_id=e.get("event_id"))
         append_pending_resend({**e, "status": "sent", "reply_ts": reply_ts,
                                "at": datetime.now(timezone.utc).isoformat()})
         summary["sent"] += 1
@@ -467,14 +528,53 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
 
 
 
-def reconcile(thread_reader=None):
+def metadata_thread_replies(channel, thread_ts, event_id):
+    """Yanayana's thread replies for one ambiguous entry, metadata-aware.
+
+    Reads the thread with include_all_metadata and drops our own
+    messages stamped with a *different* event_id: a same-text reply
+    to another event is that event's answer, not this entry's, so it
+    must not resolve the entry. Messages with no stamp (sent before
+    stamping existed, or manual posts) stay as text candidates, as do
+    messages stamped with this event_id.
+
+    Added 2026-11-15 from Yama's confirmation in #slack-へようこそ:
+    their reconcile excludes different-event_id posts at all four
+    matching points, while ours still matched the periodic sweep by
+    text alone -- the same gap Neiro had just corrected on their side.
+    Raises RuntimeError when the token cannot be resolved or the read
+    fails; the caller leaves the entry unresolved instead of deciding
+    from a metadata-blind read.
+    """
+    token = pm.resolve_token()
+    if not token:
+        raise RuntimeError("metadata check: token not found")
+    messages = pm.read_thread(channel, thread_ts, token)
+    out = []
+    for m in messages:
+        if m.get("user") != YANAYANA_USER or m.get("ts") == thread_ts:
+            continue
+        stamped = pm.stamp_event_id(m)
+        if stamped is not None and stamped != str(event_id):
+            continue
+        out.append({"ts": m.get("ts"), "text": m.get("text") or ""})
+    return out
+
+
+def reconcile(thread_reader=None, metadata_reader=None):
     """One sweep. Returns a summary dict.
 
     thread_reader(channel, thread_ts) -> [{"ts": ..., "text": ...}]
     defaults to reply_once.thread_yanayana_replies (live Slack read).
-    Tests inject a fake reader, so no real Slack call is made.
+    metadata_reader(channel, thread_ts, event_id) -> same shape,
+    defaults to metadata_thread_replies: used for entries that carry
+    an event_id, so a same-text reply stamped for another event
+    cannot resolve the entry. Entries without an event_id keep the
+    old text-only reader. Tests inject fake readers, so no real Slack
+    call is made.
     """
     reader = thread_reader or ro.thread_yanayana_replies
+    meta_reader = metadata_reader or metadata_thread_replies
     entries = load_ambiguous()
     resolved_targets = {e.get("target_ts") for e in entries
                         if e.get("outcome") == "resolved_by_thread_check"}
@@ -517,7 +617,19 @@ def reconcile(thread_reader=None):
             continue
         summary["checked"] += 1
         try:
-            replies = reader(e.get("channel"), e.get("thread_ts"))
+            # Entries stamped with an event_id are matched through
+            # the metadata-aware reader, which excludes replies
+            # stamped for another event (Yama's confirmation
+            # 2026-11-15). Entries without one (recorded before
+            # stamping, or by a path that had no event_id) keep the
+            # old text-only reader. A metadata read failure leaves
+            # the entry unresolved rather than falling back to a
+            # metadata-blind match.
+            if e.get("event_id"):
+                replies = meta_reader(e.get("channel"), e.get("thread_ts"),
+                                      e.get("event_id"))
+            else:
+                replies = reader(e.get("channel"), e.get("thread_ts"))
         except Exception as exc:
             summary["skipped_read_failed"] += 1
             summary["details"].append(
@@ -531,8 +643,10 @@ def reconcile(thread_reader=None):
         if found:
             used_reply_ts.add(found.get("ts"))
             ro.record_reply(e.get("channel"), e.get("thread_ts"), target_ts,
-                            found.get("ts"), recovered=True)
-            ro.resolve_ambiguous(e.get("channel"), e.get("thread_ts"), target_ts)
+                            found.get("ts"), recovered=True,
+                            event_id=e.get("event_id"))
+            ro.resolve_ambiguous(e.get("channel"), e.get("thread_ts"), target_ts,
+                                 event_id=e.get("event_id"))
             summary["resolved"] += 1
             summary["details"].append(
                 {"target_ts": target_ts, "result": "resolved",
@@ -546,7 +660,7 @@ def reconcile(thread_reader=None):
 def cmd_record(argv):
     """reconcile_ambiguous.py record --channel C --thread-ts T
     --target-ts M --questioner U --error-kind KIND --message TEXT
-    [--first-failed-at ISO8601]
+    [--first-failed-at ISO8601] [--event-id Ev...]
 
     Records a pre-check failure for a later delayed resend. Exits 1
     (and records nothing) for a non-transient error kind or a
@@ -557,7 +671,8 @@ def cmd_record(argv):
     while i < len(argv):
         a = argv[i]
         if a in ("--channel", "--thread-ts", "--target-ts", "--questioner",
-                 "--error-kind", "--message", "--first-failed-at") and i + 1 < len(argv):
+                 "--error-kind", "--message", "--first-failed-at",
+                 "--event-id") and i + 1 < len(argv):
             opts[a[2:]] = argv[i + 1]
             i += 2
         else:
@@ -573,7 +688,7 @@ def cmd_record(argv):
         failed_at = record_pending_resend(
             opts["channel"], opts["thread-ts"], opts["target-ts"],
             opts["message"], opts["questioner"], opts["error-kind"],
-            opts.get("first-failed-at"))
+            opts.get("first-failed-at"), opts.get("event-id"))
     except ValueError as exc:
         print(f"record: {exc}", file=sys.stderr)
         return 1

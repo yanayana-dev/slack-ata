@@ -258,6 +258,88 @@ def main():
               [l.get("event") for l in lines[-2:]] == ["started", "finished"]
               and lines[-1].get("ok") is False, str(lines))
 
+        # 12. Metadata guard (Yama's confirmation 2026-11-15: their
+        # reconcile excludes replies stamped with a different
+        # event_id at all four matching points).
+        # 12a. metadata_thread_replies drops our replies stamped for
+        # another event, keeps this event's stamp and unstamped posts.
+        orig_resolve = ra.pm.resolve_token
+        orig_read = ra.pm.read_thread
+        ra.pm.resolve_token = lambda: "xoxb-REPLACE-ME"
+        def fake_thread(channel, thread_ts, token, **kw):
+            return [
+                {"ts": "2000.000001", "user": "U0EXAMPLEBOT",
+                 "text": "hello",
+                 "metadata": {"event_type": "yanayana_reply",
+                              "event_payload": {"event_id": "EvOTHER"}}},
+                {"ts": "2000.000002", "user": "U0EXAMPLEBOT",
+                 "text": "hello",
+                 "metadata": {"event_type": "yanayana_reply",
+                              "event_payload": {"event_id": "EvMINE"}}},
+                {"ts": "2000.000003", "user": "U0EXAMPLEBOT",
+                 "text": "hello"},
+                {"ts": "2000.000004", "user": "U0EXAMPLEUSER",
+                 "text": "hello"},
+            ]
+        ra.pm.read_thread = fake_thread
+        try:
+            got = ra.metadata_thread_replies("C0TEST", "111.1", "EvMINE")
+        finally:
+            ra.pm.resolve_token = orig_resolve
+            ra.pm.read_thread = orig_read
+        check("metadata read drops other-event stamp, keeps own + unstamped",
+              [m["ts"] for m in got] == ["2000.000002", "2000.000003"], str(got))
+        # 12b. An entry carrying event_id is resolved through the
+        # metadata reader (the text-only reader must not be called).
+        def amb_ev(target, event_id, message="hello"):
+            e = amb(target=target, message=message)
+            e["event_id"] = event_id
+            return e
+        write_ambiguous(tmp, [amb_ev("1000.000050", "EvMINE")])
+        s = ra.reconcile(
+            thread_reader=lambda c, t: (_ for _ in ()).throw(AssertionError("text reader must not run")),
+            metadata_reader=lambda c, t, eid: [{"ts": "1000.000051", "text": "hello"}] if eid == "EvMINE" else (_ for _ in ()).throw(AssertionError("wrong event_id")))
+        check("entry with event_id resolves via metadata reader",
+              s["resolved"] == 1 and s["checked"] == 1, str(s))
+        # 12c. Only a same-text reply stamped for another event exists
+        # -> the metadata reader returns nothing -> unresolved.
+        write_ambiguous(tmp, [amb_ev("1000.000060", "EvMINE")])
+        s = ra.reconcile(
+            thread_reader=lambda c, t: (_ for _ in ()).throw(AssertionError("text reader must not run")),
+            metadata_reader=lambda c, t, eid: [])
+        check("other-event reply alone does not resolve",
+              s["resolved"] == 0 and s["still_unresolved"] == 1, str(s))
+        # 12d. Metadata read failure -> skipped, entry unresolved
+        # (never falls back to a metadata-blind text match).
+        write_ambiguous(tmp, [amb_ev("1000.000070", "EvMINE")])
+        def boom_meta(c, t, eid):
+            raise RuntimeError("metadata read down")
+        s = ra.reconcile(
+            thread_reader=lambda c, t: (_ for _ in ()).throw(AssertionError("text reader must not run")),
+            metadata_reader=boom_meta)
+        check("metadata read failure skips entry unresolved",
+              s["skipped_read_failed"] == 1 and s["still_unresolved"] == 0, str(s))
+        # 12e. Entries without an event_id still use the text reader.
+        write_ambiguous(tmp, [amb(target="1000.000080", message="hello")])
+        s = ra.reconcile(
+            thread_reader=lambda c, t: [{"ts": "1000.000081", "text": "hello"}],
+            metadata_reader=lambda c, t, eid: (_ for _ in ()).throw(AssertionError("metadata reader must not run")))
+        check("entry without event_id still uses text reader",
+              s["resolved"] == 1, str(s))
+        # 12f. record_ambiguous stores the event_id on the entry.
+        write_ambiguous(tmp, [])
+        ra.ro.record_ambiguous("C0TEST", "111.1", "1000.000090",
+                               "send-response-lost", "hello", event_id="EvMINE")
+        entries = read_jsonl(os.path.join(tmp, "events", "ambiguous_posts.jsonl"))
+        check("record_ambiguous stores event_id",
+              len(entries) == 1 and entries[0].get("event_id") == "EvMINE"
+              and entries[0].get("message") == "hello", str(entries))
+        ra.ro.record_ambiguous("C0TEST", "111.1", "1000.000091",
+                               "send-response-lost", "hello")
+        entries = read_jsonl(os.path.join(tmp, "events", "ambiguous_posts.jsonl"))
+        check("record_ambiguous without event_id omits the field",
+              len(entries) == 2 and "event_id" not in entries[1], str(entries))
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 1 if CHECKS[1] else 0
 

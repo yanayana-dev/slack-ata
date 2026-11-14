@@ -32,7 +32,7 @@ SPEC.loader.exec_module(ra)
 
 CHECKS = [0, 0]  # [passed, failed]
 YANAYANA = "U0EXAMPLEBOT"
-QUESTIONER = "U0QUESTIONER"
+QUESTIONER = "U0EXAMPLEASKER"
 OTHER = "U0OTHER"
 
 
@@ -66,9 +66,10 @@ def pending_path(tmp):
 
 
 def record(tmp, target="222.2", message="hello", questioner=QUESTIONER,
-           kind="history_unavailable", failed_at="2026-11-13T14:00:00+00:00"):
+           kind="history_unavailable", failed_at="2026-11-13T14:00:00+00:00",
+           event_id=None):
     return ra.record_pending_resend("C0TEST", "111.1", target, message,
-                                    questioner, kind, failed_at)
+                                    questioner, kind, failed_at, event_id)
 
 
 def thread_with(*msgs):
@@ -375,7 +376,7 @@ def main():
         sent = []
         s = ra.reconcile_pending_resends(
             thread_reader=thread_with(
-                {"ts": "333.3", "user": OTHER, "bot_id": "B0OTHERBOT",
+                {"ts": "333.3", "user": OTHER, "bot_id": "B0EXAMPLEOTHER",
                  "text": "I can answer that in detail"}),
             sender=lambda c, t, m: sent.append(m) or "999.9",
             now=now)
@@ -433,8 +434,75 @@ def main():
               status_of(tmp, "222.41") == "sent")
 
         clear(tmp)
+        # 21. Stamp guard for the already-sent check (Neiro's share
+        # 2026-11-15, neiro-slack-system commit 2af573d): an entry
+        # recorded with an event_id whose thread holds a same-text
+        # Yanayana reply stamped for ANOTHER event must not count
+        # that reply as delivered -- it is the other event's answer.
+        # The text-only thread read still sees it; the metadata read
+        # (fake) drops it, so the resend still goes out.
+        record(tmp, target="222.42", event_id="EvAAA")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            metadata_reader=lambda c, t, e: [],
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("different-event same-text reply is not already-sent",
+              s["sent"] == 1 and len(sent) == 1, str(s))
+        check("entry with event_id stores it",
+              any(e.get("event_id") == "EvAAA"
+                  for e in read_jsonl(pending_path(tmp))),
+              str(read_jsonl(pending_path(tmp))))
+
+        clear(tmp)
+        # 22. Same-event reply found through the metadata read is
+        # recorded recovered, never reposted.
+        record(tmp, target="222.43", event_id="EvAAA")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            metadata_reader=lambda c, t, e: [{"ts": "444.4", "text": "hello"}],
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("same-event reply via metadata read is not reposted",
+              s["sent"] == 1 and sent == [], str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("same-event reply recorded recovered",
+              any(r.get("target_ts") == "222.43" and r.get("recovered") is True
+                  and r.get("reply_ts") == "444.4" for r in replied),
+              str(replied))
+
+        clear(tmp)
+        # 23. Metadata read failure leaves the entry pending (no
+        # metadata-blind fallback, same stance as the ambiguous sweep).
+        record(tmp, target="222.44", event_id="EvAAA")
+
+        def meta_boom(c, t, e):
+            raise RuntimeError("metadata down")
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            metadata_reader=meta_boom,
+            sender=lambda c, t, m: (_ for _ in ()).throw(AssertionError("must not send")),
+            now=now)
+        check("metadata read failure leaves entry pending",
+              s["skipped_read_failed"] == 1 and s["still_pending"] == 1, str(s))
+        check("entry still pending after metadata read failure",
+              status_of(tmp, "222.44") == "pending")
+
+        clear(tmp)
         # 16. main() runs the pending sweep under the same hourly gate.
-        record(tmp, target="222.32")
+        # The failure time must be recent in wall-clock terms: main()
+        # uses real time (unlike the pinned `now` above), and the 24h
+        # resend window is measured from it -- the fixed 2026-11-13
+        # default expired a day after it was written (2026-11-15).
+        recent = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 3600,
+            timezone.utc).isoformat()
+        record(tmp, target="222.32", failed_at=recent)
         ra.ro.thread_yanayana_replies = lambda c, t: []
         # Stub the live reader/sender used by main()'s defaults.
         orig_reader = ra.thread_all_messages

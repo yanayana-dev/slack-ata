@@ -26,6 +26,15 @@ fail-closed on its own read failure -- rather than blocking a
 reply the text check can verify. Without --event-id (manual posts
 with no originating event) the behaviour is unchanged.
 
+Stamp guard (added 2026-11-15, from Neiro's correction in
+#slack-へようこそ): the text check reads the thread with
+include_all_metadata and excludes our own messages stamped with a
+different event_id, so a same-text reply to another event no
+longer counts as this event's duplicate. Yama had shared the same
+guard as designed, then found it was never in their code; our
+slackcli text read had the same gap, so the guard was adopted
+here (stamped_texts) rather than only noted.
+
 Granularity: with --target-ts (the ts of the message being answered),
 idempotency is per target message -- a reply to a different message in
 the same thread is a new reply, not a duplicate (the thread-only check
@@ -483,12 +492,21 @@ def _append_jsonl(path, record):
 
 
 def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False,
-                 message=None):
+                 message=None, event_id=None):
     # The sent text is stored (added 2026-11-14, answering Yama's
     # question in #slack-へようこそ): until now the record kept only
     # ts values, so a later incident could only be reconstructed from
     # the live thread, not from local records. With the text in the
     # ledger, what was actually sent is provable offline.
+    # The originating event_id is stored too when the caller knows it
+    # (added 2026-11-15 from Neiro's correction in #slack-へようこそ:
+    # their reconcile fix started from the record side because the
+    # ambiguous record carried no mark; the same was true of this
+    # ledger and of the correction entries -- a later reader could not
+    # tell from the record alone which event a reply answers. The
+    # field is the originating event id (audit); it does not claim the
+    # reply itself carries that stamp -- manual and resend paths send
+    # without one. Entries recorded without one keep the old shape.
     entry = {
         "thread_ts": thread_ts, "reply_ts": reply_ts,
         "channel": channel,
@@ -498,6 +516,8 @@ def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False,
     }
     if message is not None:
         entry["text"] = message
+    if event_id is not None:
+        entry["event_id"] = event_id
     _append_jsonl(REPLIED, entry)
 
 
@@ -509,7 +529,7 @@ def load_ambiguous():
         return []
 
 
-def resolve_ambiguous(channel, thread_ts, target_ts):
+def resolve_ambiguous(channel, thread_ts, target_ts, event_id=None):
     """Correct an ambiguous_post_outcome record once a later check
     proves the reply did land.
 
@@ -519,9 +539,14 @@ def resolve_ambiguous(channel, thread_ts, target_ts):
     leaving "reply not posted" standing misleads later triage. The
     original ambiguous entry is kept as history; a
     resolved_by_thread_check entry is appended for the same target
-    so any reader sees the correction. No-op when there is no
-    unresolved ambiguous entry for the target, or one was already
-    resolved. Returns True when a resolution entry was appended.
+    so any reader sees the correction. The correction entry carries
+    the originating event_id when the caller knows it (added
+    2026-11-15 from Neiro's correction in #slack-へようこそ: their
+    fix keeps the mark on the correction entries too, so the
+    correction is attributable to its event without re-reading the
+    thread). No-op when there is no unresolved ambiguous entry for
+    the target, or one was already resolved. Returns True when a
+    resolution entry was appended.
     """
     entries = load_ambiguous()
     unresolved = [e for e in entries
@@ -532,14 +557,17 @@ def resolve_ambiguous(channel, thread_ts, target_ts):
                and e.get("target_ts") == target_ts]
     if not unresolved or already:
         return False
-    _append_jsonl(AMBIGUOUS, {
+    correction = {
         "outcome": "resolved_by_thread_check",
         "thread_ts": thread_ts, "target_ts": target_ts,
         "channel": channel,
         "note": ("reply found in thread on a later pre-send check; "
                  "the earlier ambiguous_post_outcome record was wrong"),
         "at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if event_id is not None:
+        correction["event_id"] = event_id
+    _append_jsonl(AMBIGUOUS, correction)
     return True
 
 
@@ -581,12 +609,18 @@ def close_no_text(channel, thread_ts, target_ts):
     return True
 
 
-def record_ambiguous(channel, thread_ts, target_ts, reason, message=None):
+def record_ambiguous(channel, thread_ts, target_ts, reason, message=None,
+                     event_id=None):
     # The message text is stored so a later periodic reconciliation
     # (reconcile_ambiguous.py, adopted 2026-11-12 from Yama's share)
     # can match the entry against the live thread by exact text.
     # Without the text an ambiguous entry can never be proven
     # delivered except by a later pre-send check for the same target.
+    # The originating event_id is stored too (added 2026-11-15 from
+    # Yama's confirmation in #slack-へようこそ: their reconcile
+    # excludes replies stamped with a different event_id): the sweep
+    # can then tell a same-text reply to *this* event from one to
+    # another event. Entries without one keep the old text-only match.
     entry = {
         "outcome": "ambiguous_post_outcome",
         "thread_ts": thread_ts, "target_ts": target_ts,
@@ -595,6 +629,8 @@ def record_ambiguous(channel, thread_ts, target_ts, reason, message=None):
     }
     if message is not None:
         entry["message"] = message
+    if event_id is not None:
+        entry["event_id"] = event_id
     _append_jsonl(AMBIGUOUS, entry)
 
 
@@ -613,6 +649,43 @@ def metadata_reply_found(channel, thread_ts, event_id):
     found = post_metadata.find_reply(channel, thread_ts, token,
                                      event_id=event_id)
     return found.get("ts") if found else None
+
+
+def stamped_texts(channel, thread_ts, event_id, since_ts=None):
+    """Texts of Yanayana's replies, excluding other events' replies.
+
+    Reads the thread with include_all_metadata and drops our own
+    messages stamped with a *different* event_id: a same-text reply
+    to another event is that event's answer, not this one's
+    duplicate, so it must not block this send. Messages with no
+    stamp (sent before stamping existed, or manual posts) stay as
+    text candidates, as do messages stamped with this event_id
+    (already caught by metadata_reply_found, kept here for safety).
+
+    Added 2026-11-15 from Neiro's correction in #slack-へようこそ:
+    Yama had shared that their text matching excluded replies
+    stamped with a different event_id, then found the guard was
+    never in their code -- their ledger and thread text checks
+    read without metadata, so a same-text reply to another event
+    counted as a duplicate. Our text fallback had the same gap
+    (slackcli read, no metadata), so the guard belongs here too.
+    Raises RuntimeError when the token cannot be resolved or the
+    read fails; the caller falls back to the slackcli text read.
+    """
+    token = post_metadata.resolve_token()
+    if not token:
+        raise RuntimeError("stamped text check: token not found")
+    messages = post_metadata.read_thread(channel, thread_ts, token,
+                                         oldest=since_ts)
+    texts = []
+    for m in messages:
+        if m.get("user") != YANAYANA_USER or m.get("ts") == thread_ts:
+            continue
+        stamped = post_metadata.stamp_event_id(m)
+        if stamped is not None and stamped != str(event_id):
+            continue
+        texts.append(m.get("text") or "")
+    return texts
 
 
 def already_replied(channel, thread_ts, target_ts=None, message=None,
@@ -643,7 +716,23 @@ def already_replied(channel, thread_ts, target_ts=None, message=None,
         # mode (no target) has no anchor and keeps the full-thread
         # read, as Yama's design does for event-less posts.
         since_ts = window_start(target_ts) if target_ts else None
-        texts = thread_yanayana_texts(channel, thread_ts, since_ts=since_ts)
+        if event_id:
+            # Metadata-aware text check: exclude our replies stamped
+            # with a different event_id (see stamped_texts). When
+            # the stamped read fails, fall back to the slackcli text
+            # read -- degraded to the old gap for that run, but the
+            # warning says so, and the read itself stays fail-closed.
+            try:
+                texts = stamped_texts(channel, thread_ts, event_id,
+                                      since_ts=since_ts)
+            except Exception as e:
+                print(f"warning: stamped text check failed ({e}); "
+                      f"falling back to slackcli text check",
+                      file=sys.stderr)
+                texts = thread_yanayana_texts(channel, thread_ts,
+                                              since_ts=since_ts)
+        else:
+            texts = thread_yanayana_texts(channel, thread_ts, since_ts=since_ts)
         if target_ts:
             # Other replies in the thread answer other messages and do
             # not block this one; only the exact same text (what a
@@ -732,7 +821,8 @@ def main(argv):
         # A reply is already proven for this target: if an earlier
         # send was recorded ambiguous, correct that record now.
         if target_ts:
-            resolve_ambiguous(channel, thread_ts, target_ts)
+            resolve_ambiguous(channel, thread_ts, target_ts,
+                              event_id=event_id)
             if found == "thread" and message and not in_record_for_target(target_ts):
                 # Adopted 2026-11-12 from Yama's self-review proposal in
                 # #slack-へようこそ (their record-reply path): a reply
@@ -746,7 +836,8 @@ def main(argv):
                         if r["text"] == message:
                             record_reply(channel, thread_ts, target_ts,
                                          r["ts"], recovered=True,
-                                         message=r["text"])
+                                         message=r["text"],
+                                         event_id=event_id)
                             break
                 except Exception as e:
                     print(f"warning: could not record thread-found reply ({e})",
@@ -796,13 +887,14 @@ def main(argv):
                                  since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
-                         message=message)
+                         message=message, event_id=event_id)
             print("sent (recovered: reply found in thread after lost send response)")
             return 0
         reason = ("send-response-lost; recovery check could not verify delivery"
                   if outcome is None else
                   "send-response-lost; recovery check confirmed reply absent")
-        record_ambiguous(channel, thread_ts, target_ts, reason, message)
+        record_ambiguous(channel, thread_ts, target_ts, reason, message,
+                         event_id=event_id)
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
@@ -814,17 +906,19 @@ def main(argv):
                                  since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
-                         message=message)
+                         message=message, event_id=event_id)
             print("sent (recovered: reply found in thread, send gave no ts)")
             return 0
         reason = ("send gave no ts; recovery check could not verify delivery"
                   if outcome is None else
                   "send gave no ts; recovery check confirmed reply absent")
-        record_ambiguous(channel, thread_ts, target_ts, reason, message)
+        record_ambiguous(channel, thread_ts, target_ts, reason, message,
+                         event_id=event_id)
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
-    record_reply(channel, thread_ts, target_ts, reply_ts, message=message)
+    record_reply(channel, thread_ts, target_ts, reply_ts, message=message,
+                 event_id=event_id)
     print(f"sent reply_ts={reply_ts}")
     return 0
 
