@@ -108,7 +108,7 @@ def main():
         check("readable again resends once", s["sent"] == 1 and s["checked"] == 1, str(s))
         check("resend carries prefix + original failure time (JST)",
               len(sent) == 1 and sent[0].startswith(
-                  "遅れての再送（元の失敗時刻：2026-11-13 23:00 JST）\nhello"),
+                  "遅れての再送（最初の試行：2026-11-13 23:00 JST）\nhello"),
               str(sent))
         replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
         check("resent reply recorded with ts",
@@ -302,7 +302,95 @@ def main():
               status_of(tmp, "222.34") == "sent")
 
         clear(tmp)
-        # 15. main() runs the pending sweep under the same hourly gate.
+        # 15. Two pending resends with identical text share one reply
+        # in the thread: the first recovers it, the second must not
+        # "recover" the same ts -- it resends instead. (Yama's
+        # assigned_reply_ts, adopted 2026-11-14.)
+        record(tmp, target="222.35")
+        record(tmp, target="222.36")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("one shared reply recovers only one resend",
+              s["sent"] == 2 and len(sent) == 1, str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("first target recovered with the shared ts",
+              any(r.get("target_ts") == "222.35" and r.get("recovered") is True
+                  and r.get("reply_ts") == "444.4" for r in replied),
+              str(replied))
+        check("second target resent, not falsely recovered",
+              any(r.get("target_ts") == "222.36" and r.get("recovered") is not True
+                  and r.get("reply_ts") == "999.9" for r in replied),
+              str(replied))
+
+        # 15b. A reply ts consumed in an EARLIER sweep must not be
+        # "recovered" again for a different pending entry (Neiro's
+        # share 2026-11-14: already-resolved found_ts counts as used).
+        # The 444.4 reply already recovered 222.35 above and sits in
+        # replied.jsonl; a new pending entry with the same text must
+        # resend with a fresh ts, not claim the old one.
+        record(tmp, target="222.37")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "444.4", "user": YANAYANA, "text": "hello"}),
+            sender=lambda c, t, m: sent.append(m) or "999.8",
+            now=now)
+        check("reply ts from earlier sweep is not re-recovered",
+              s["sent"] == 1 and len(sent) == 1, str(s))
+        replied = read_jsonl(os.path.join(tmp, "events", "replied.jsonl"))
+        check("new entry resent with a fresh ts, not the old one",
+              any(r.get("target_ts") == "222.37" and r.get("recovered") is not True
+                  and r.get("reply_ts") == "999.8" for r in replied),
+              str(replied))
+
+        clear(tmp)
+        # 17. A bot's long post does NOT count as answered (narrowed
+        # 2026-11-14 from Yama's resend share): another bot's
+        # auto-reply must not falsely silence a delayed resend.
+        record(tmp, target="222.38")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "333.3", "user": OTHER, "bot_id": "B0OTHERBOT",
+                 "text": "I can answer that in detail"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("bot post does not count as answered",
+              s["sent"] == 1 and len(sent) == 1, str(s))
+
+        clear(tmp)
+        # 18. A short human post (10 chars or fewer) does NOT count as
+        # answered: a bare acknowledgement is not an answer.
+        record(tmp, target="222.39")
+        sent = []
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "333.3", "user": OTHER, "text": "ありがとうございます"}),
+            sender=lambda c, t, m: sent.append(m) or "999.9",
+            now=now)
+        check("short post (10 chars) does not count as answered",
+              s["sent"] == 1 and len(sent) == 1, str(s))
+
+        clear(tmp)
+        # 19. A long human post still counts as answered.
+        record(tmp, target="222.40")
+        s = ra.reconcile_pending_resends(
+            thread_reader=thread_with(
+                {"ts": "333.3", "user": OTHER,
+                 "text": "こちらで回答できますよ"}),
+            sender=lambda c, t, m: (_ for _ in ()).throw(AssertionError("must not send")),
+            now=now)
+        check("long human post still counts as answered",
+              s["given_up"] == 1, str(s))
+        check("long-human given-up reason recorded",
+              read_jsonl(pending_path(tmp))[-1].get("reason") == "answered_by_other")
+
+        clear(tmp)
+        # 16. main() runs the pending sweep under the same hourly gate.
         record(tmp, target="222.32")
         ra.ro.thread_yanayana_replies = lambda c, t: []
         # Stub the live reader/sender used by main()'s defaults.

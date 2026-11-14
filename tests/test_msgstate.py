@@ -97,7 +97,7 @@ def make_base(messages):
 def msg(event_id="EvTest1", ts="1794478306.000001", text="hello"):
     return {"event_id": event_id, "received_at": "2026-11-12T10:00:00+00:00",
             "channel": "C0EXAMPLE001", "channel_type": "channel",
-            "user": "U0EXAMPLEPEER", "text": text, "ts": ts, "thread_ts": None}
+            "user": "U0EXAMPLEUSER", "text": text, "ts": ts, "thread_ts": None}
 
 
 def set_stale(base, key, attempts):

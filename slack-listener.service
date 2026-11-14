@@ -1,5 +1,5 @@
 [Unit]
-Description=Slack Socket Mode listener for Ata (workspace example-workspace)
+Description=Slack Socket Mode listener for Ata (workspace muse-board)
 After=network-online.target
 Wants=network-online.target
 

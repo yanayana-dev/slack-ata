@@ -11,12 +11,20 @@ ambiguous entries against the live thread on a schedule (the poll hook
 runs it; it self-gates to at most once an hour) and, when the exact
 reply text is found, records the reply (recovered) and marks the
 ambiguous entry resolved -- the same record-reply path a pre-send
-check uses.
+check uses. A reply ts consumed by one entry is never reused for
+another entry, in the same sweep or a later one (Yama's
+assigned_reply_ts idea, adopted 2026-11-14; seeded from replied.jsonl
+per Neiro's share 2026-11-14): two entries with identical text cannot resolve
+to the same reply.
 
-Only entries that stored the message text can be matched; older
-entries without one are skipped (listed in the summary). A thread
-read failure also leaves the entry unresolved -- delivery is never
-guessed. A found reply is never reposted; this script only corrects
+Only entries that stored the message text can be matched; entries
+without one are closed as closed_no_text on first sight (decided
+with Yama 2026-11-14: waiting cannot make them matchable, and the
+hourly sweep runs unattended so a manual-confirmation step would
+mean leaving them unresolved forever; the record stays in the
+ledger and a later pre-send check can still resolve the target if
+the reply is found). A thread read failure also leaves the entry
+unresolved -- delivery is never guessed. A found reply is never reposted; this script only corrects
 records. A match also requires the reply to be posted *after* the
 target message (msg.ts > event.ts, adopted 2026-11-14 from Yama's
 audit share): an identical-text reply from before the event must
@@ -36,8 +44,11 @@ and this hourly sweep retries it:
     delivered reply plus someone else's answer would be given up
     without ever reaching replied.jsonl.
   - someone else already answered (a text post after the target, by
-    anyone other than the questioner and Yanayana herself) -> give up,
-    record only.
+    anyone other than the questioner and Yanayana herself, from a
+    human -- not a bot -- with more than 10 characters of text;
+    narrowed 2026-11-14 from Yama's share: another bot's auto-reply
+    or a short acknowledgement must not falsely silence a resend)
+    -> give up, record only.
   - 24h pass without a successful read -> give up, record only.
     No +5 minute grace: with an hourly check there are up to 24
     chances inside the window, so the grace the old design needed
@@ -184,6 +195,16 @@ def format_failed_at_jst(iso):
 
 
 def resend_prefix(first_failed_at):
+    # Unified 3-way wording agreed 2026-11-14 (Yama's proposal, Neiro
+    # already uses the same year+JST form): "最初の試行" reads
+    # unambiguously as the first attempt, where "元の失敗時刻" could be
+    # read as the latest failure after retries.
+    return f"遅れての再送（最初の試行：{format_failed_at_jst(first_failed_at)}）\n"
+
+
+def resend_prefix_legacy(first_failed_at):
+    # Pre-agreement wording, kept so a resend already sent with the old
+    # prefix is still recognised as delivered in the thread check below.
     return f"遅れての再送（元の失敗時刻：{format_failed_at_jst(first_failed_at)}）\n"
 
 
@@ -227,6 +248,7 @@ def thread_all_messages(channel, thread_ts):
     for _page in range(20):  # safety cap: 20 pages x 100 messages
         data = ro.thread_read_page_retry(channel, thread_ts, oldest)
         messages.extend({"ts": m.get("ts"), "user": m.get("user"),
+                         "bot_id": m.get("bot_id"),
                          "text": m.get("text") or ""}
                         for m in data.get("messages", []))
         if not data.get("has_more"):
@@ -250,6 +272,14 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
     reader = thread_reader or thread_all_messages
     send = sender or ro.send
     now_epoch = now if now is not None else time.time()
+    # Reply ts consumed by one entry in this sweep (recovered or just
+    # sent) must not resolve another entry: same idea as Yama's
+    # assigned_reply_ts, adopted 2026-11-14. Seeded from replied.jsonl
+    # (Neiro's share 2026-11-14: treat an already-resolved found_ts
+    # as used) so a reply recorded in an earlier sweep is not
+    # matched again to a different pending entry here.
+    used_reply_ts = {r.get("reply_ts") for r in ro.load_record()
+                     if r.get("reply_ts")}
     summary = {"checked": 0, "sent": 0, "given_up": 0,
                "still_pending": 0, "skipped_read_failed": 0, "details": []}
     for target_ts, e in latest_pending_resends().items():
@@ -286,11 +316,16 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
         # order gave up as answered_by_other and the delivered reply
         # was never recorded in replied.jsonl.
         prefixed = resend_prefix(first_failed_at) + message
+        legacy_prefixed = resend_prefix_legacy(first_failed_at) + message
+        # Yama's assigned_reply_ts idea (adopted 2026-11-14): a reply ts
+        # consumed by one entry must not resolve another in this sweep.
         found = next((m for m in messages
                       if m.get("user") == YANAYANA_USER
-                      and m.get("text") in (message, prefixed)
+                      and m.get("text") in (message, prefixed, legacy_prefixed)
+                      and m.get("ts") not in used_reply_ts
                       and _is_reply_after_event(m.get("ts"), target_ts)), None)
         if found:
+            used_reply_ts.add(found.get("ts"))
             ro.record_reply(channel, thread_ts, target_ts,
                             found.get("ts"), recovered=True)
             append_pending_resend({**e, "status": "sent", "recovered": True,
@@ -302,12 +337,19 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
                                        "recovered": True})
             continue
         # Someone else already answered: a text post after the target,
-        # by anyone other than the questioner and Yanayana herself.
+        # by anyone other than the questioner and Yanayana herself,
+        # from a human (not a bot) with more than 10 characters of
+        # text. Narrowed 2026-11-14 from Yama's share (their
+        # resend fix, tests 36/36): another bot's auto-reply or a
+        # short acknowledgement ("ありがとう" etc.) must not falsely
+        # silence a delayed resend -- false silence is worse than a
+        # resend marked "遅れての再送".
         answered_by = next(
             (m for m in messages
-             if (m.get("ts") or "") > (target_ts or "")
+             if _is_reply_after_event(m.get("ts"), target_ts)
              and m.get("user") not in (questioner, YANAYANA_USER)
-             and (m.get("text") or "").strip()),
+             and not m.get("bot_id")
+             and len((m.get("text") or "").strip()) > 10),
             None)
         if answered_by:
             append_pending_resend({**e, "status": "given_up",
@@ -344,6 +386,7 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None):
                                        "error": str(exc)[:200]})
             continue
         if reply_ts:
+            used_reply_ts.add(reply_ts)
             ro.record_reply(channel, thread_ts, target_ts, reply_ts)
         append_pending_resend({**e, "status": "sent", "reply_ts": reply_ts,
                                "at": datetime.now(timezone.utc).isoformat()})
@@ -365,6 +408,8 @@ def reconcile(thread_reader=None):
     entries = load_ambiguous()
     resolved_targets = {e.get("target_ts") for e in entries
                         if e.get("outcome") == "resolved_by_thread_check"}
+    closed_targets = {e.get("target_ts") for e in entries
+                      if e.get("outcome") == "closed_no_text"}
     # Latest entry per unresolved target wins; older duplicates of the
     # same target are the same lost send, not separate work.
     latest = {}
@@ -372,14 +417,29 @@ def reconcile(thread_reader=None):
         if e.get("outcome") == "ambiguous_post_outcome":
             latest[e.get("target_ts")] = e
     summary = {"checked": 0, "resolved": 0, "still_unresolved": 0,
-               "skipped_no_text": 0, "skipped_read_failed": 0, "details": []}
+               "closed_no_text": 0, "skipped_no_text": 0,
+               "skipped_read_failed": 0, "details": []}
+    # Same no-reuse rule as the pending-resend sweep (Yama's
+    # assigned_reply_ts, adopted 2026-11-14): two ambiguous entries
+    # with identical text must not resolve to the same reply ts.
+    # Seeded from replied.jsonl (Neiro's share 2026-11-14: treat an
+    # already-resolved found_ts as used): a reply ts that resolved
+    # an entry in an earlier sweep must not resolve a different
+    # entry in this one -- used_reply_ts used to reset every sweep,
+    # so the same physical reply could be matched twice.
+    used_reply_ts = {r.get("reply_ts") for r in ro.load_record()
+                     if r.get("reply_ts")}
     for target_ts, e in latest.items():
-        if target_ts in resolved_targets:
+        if target_ts in resolved_targets or target_ts in closed_targets:
             continue
         message = e.get("message")
         if not message:
-            summary["skipped_no_text"] += 1
-            summary["details"].append({"target_ts": target_ts, "result": "skipped_no_text"})
+            if ro.close_no_text(e.get("channel"), e.get("thread_ts"), target_ts):
+                summary["closed_no_text"] += 1
+                summary["details"].append({"target_ts": target_ts, "result": "closed_no_text"})
+            else:
+                summary["skipped_no_text"] += 1
+                summary["details"].append({"target_ts": target_ts, "result": "skipped_no_text"})
             continue
         summary["checked"] += 1
         try:
@@ -392,8 +452,10 @@ def reconcile(thread_reader=None):
             continue
         found = next((r for r in replies
                       if r.get("text") == message
+                      and r.get("ts") not in used_reply_ts
                       and _is_reply_after_event(r.get("ts"), target_ts)), None)
         if found:
+            used_reply_ts.add(found.get("ts"))
             ro.record_reply(e.get("channel"), e.get("thread_ts"), target_ts,
                             found.get("ts"), recovered=True)
             ro.resolve_ambiguous(e.get("channel"), e.get("thread_ts"), target_ts)

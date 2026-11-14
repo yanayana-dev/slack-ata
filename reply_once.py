@@ -328,6 +328,44 @@ def resolve_ambiguous(channel, thread_ts, target_ts):
     return True
 
 
+def close_no_text(channel, thread_ts, target_ts):
+    """Close a no-text ambiguous entry as unmatchable, not resolved.
+
+    Agreed with Yama 2026-11-14 in #slack-へようこそ (Yanayana's
+    closed_no_text proposal): an entry without message text can never
+    be proven delivered by text matching, so keeping it "unresolved"
+    forever only pollutes the unresolved count with entries that
+    cannot be checked. Closing appends a closed_no_text record --
+    distinct from resolved_by_thread_check -- and the entry leaves
+    the reconcile sweep. The original entry stays as history, and a
+    later pre-send check can still append resolved_by_thread_check
+    for the same target if the reply is actually found in the thread.
+    No-op when there is no unresolved ambiguous entry for the target,
+    or one was already closed or resolved. Returns True when a
+    closing entry was appended.
+    """
+    entries = load_ambiguous()
+    unresolved = [e for e in entries
+                  if e.get("outcome") == "ambiguous_post_outcome"
+                  and e.get("target_ts") == target_ts]
+    already = [e for e in entries
+               if e.get("outcome") in ("closed_no_text",
+                                      "resolved_by_thread_check")
+               and e.get("target_ts") == target_ts]
+    if not unresolved or already:
+        return False
+    _append_jsonl(AMBIGUOUS, {
+        "outcome": "closed_no_text",
+        "thread_ts": thread_ts, "target_ts": target_ts,
+        "channel": channel,
+        "note": ("no message text was recorded, so the entry can never "
+                 "be matched against the thread; closed as unmatchable, "
+                 "not resolved"),
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    return True
+
+
 def record_ambiguous(channel, thread_ts, target_ts, reason, message=None):
     # The message text is stored so a later periodic reconciliation
     # (reconcile_ambiguous.py, adopted 2026-11-12 from Yama's share)
