@@ -1,0 +1,74 @@
+#!/bin/sh
+# pre-push guard for slack-ata (tracked copy).
+# Install with: sh hooks/install-pre-push.sh
+# .git/hooks is not distributed with a clone, so the hook lives here
+# in the repo and is (re)installed from this file.
+# Adopted 2026-11-14 from Neiro's share in #slack-へようこそ: block a push
+# if any commit being pushed would leak personal info or credentials.
+# Checks, for each commit in the pushed range:
+#   1. author/committer email must be a GitHub noreply address
+#   2. the diff must not contain secret patterns (Slack/GitHub tokens,
+#      private-key headers, AWS access keys)
+#   2b. the diff must not contain a phone-number-like pattern
+#       (added 2026-11-14: Yama's gate covers phone numbers too)
+#   3. the diff must not contain any email address other than noreply /
+#      placeholder domains (example.*, *.example, *.test, *.invalid,
+#      REPLACE-ME and friends are allowed as dummies)
+# No personal data is hardcoded here: rule 3 is generic, so the real
+# address is caught without ever being written down.
+
+fail=0
+say() { printf 'pre-push guard: %s\n' "$*" >&2; }
+
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+    continue # branch deletion: nothing to check
+  fi
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    range="$local_sha --not --remotes"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  # 1. author / committer emails
+  bad_emails=$(git log --format='%ae%n%ce' $range 2>/dev/null | sort -u | grep -v '@users\.noreply\.github\.com$' || true)
+  if [ -n "$bad_emails" ]; then
+    say "blocked: non-noreply author/committer email in pushed commits:"
+    printf '%s\n' "$bad_emails" | sed 's/^/  /' >&2
+    fail=1
+  fi
+
+  # 2 + 3. diff content scan (added lines only)
+  diff=$(git diff $range 2>/dev/null | grep '^+' | grep -v '^+++' || true)
+  if [ -n "$diff" ]; then
+    # Dummy placeholders (e.g. xoxb-REPLACE-ME in config.example.json)
+    # must not trip the gate: Yama's share (2026-11-14) showed a gate
+    # blocking on detection-pattern strings sitting in docs/fixtures,
+    # so documented dummies are allowlisted explicitly.
+    hits=$(printf '%s\n' "$diff" | grep -E 'xox[baprs]-[0-9A-Za-z-]+|ghp_[0-9A-Za-z]{20,}|gho_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,}|AKIA[0-9A-Z]{16}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' | grep -v 'REPLACE-ME' || true)
+    if [ -n "$hits" ]; then
+      say "blocked: possible secret in pushed diff:"
+      printf '%s\n' "$hits" | sed 's/^/  /' >&2
+      fail=1
+    fi
+    # 2b. phone-number-like pattern (0X-XXXX-XXXX); REPLACE-ME dummies pass.
+    phones=$(printf '%s\n' "$diff" | grep -E '\b0[0-9]{1,3}-[0-9]{1,4}-[0-9]{4}\b' | grep -v 'REPLACE-ME' || true)
+    if [ -n "$phones" ]; then
+      say "blocked: possible phone number in pushed diff:"
+      printf '%s\n' "$phones" | sed 's/^/  /' >&2
+      fail=1
+    fi
+    emails=$(printf '%s\n' "$diff" | grep -E -o '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sort -u | grep -v '@users\.noreply\.github\.com$' | grep -v -E '@(example\.com|example\.org|example\.net|example|test|invalid|localhost)$' | grep -v -E '@.*\.(example|test|invalid)$' || true)
+    if [ -n "$emails" ]; then
+      say "blocked: non-noreply email address in pushed diff:"
+      printf '%s\n' "$emails" | sed 's/^/  /' >&2
+      fail=1
+    fi
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  say "push stopped. Fix the commits above (scrub to placeholders / noreply) and try again."
+  exit 1
+fi
+exit 0

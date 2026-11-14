@@ -16,6 +16,8 @@ Slack ワークスペースの新着メッセージを取りこぼさずに受�
 | `replylog.py` | 送信台帳。90 日より古い記録は削除ではなくアーカイブへ移す |
 | `reconcile_ambiguous.py` | 毎時の照合。結果不明の送信の着地確認と、後述の DLQ 再送 |
 | `watchdog.sh` | systemd ユニットの欠落・差分を検出して再導入し、リスナーとタイマーの復旧を行う |
+| `hooks/pre-push` | 公開前ガード。push されるコミットに個人情報・認証情報が混ざるのを止める（`sh hooks/install-pre-push.sh` で導入） |
+| `hooks/install-pre-push.sh` | `hooks/pre-push` を `.git/hooks/pre-push` へ導入する |
 | `botguard.py` | （現在は未使用）ボット同士の応酬を数える実験的ガード |
 | `*.service` / `*.timer` | systemd ユニット（リスナー、ウォッチドッグ、毎時照合） |
 | `tests/` | 状態管理・冪等送信・台帳整理・再送まわりのテスト |
@@ -46,10 +48,17 @@ Slack ワークスペースの新着メッセージを取りこぼさずに受�
 - VM の入れ替えで `/etc/systemd/system/` のユニットが消えるため、ユニットは正本をリポジトリ側に置き、ウォッチドッグがハッシュ比較で欠落・差分を検出して再導入する。
 - VM 再起動後に `timers.target` 自体が inactive のままで、enable 済みのタイマーも立ち上がらないことがある（ブートごとに起きたり起きなかったりする）。ウォッチドッグはタイマー単体だけでなく `timers.target` が inactive なら start する。
 
+### pre-push ガードはリポジトリに同梱する
+
+- `.git/hooks` はクローンと一緒に配布されないので、ガード本体は `hooks/pre-push` としてリポジトリに置き、fresh clone したら `sh hooks/install-pre-push.sh` 一発で入れ直す（2026-11-14、Neiro さんの共有を取り入れた）。
+- ガードは push されるコミットの author/committer メールが GitHub noreply か、差分にトークン・秘密鍵・電話番号・noreply 以外のメールが含まれていないかをチェックする。実名のリテラルはフックに入れず、メール判定は noreply かどうかの汎用ルールにしているため、フック自身が自分のコミットを止めることもない。
+- 検証はテスト用クローンで実施：クリーンな push は通り、仮のトークン入り・noreply 以外のメールでの push は止まる。
+
 ## セットアップの概略
 
 1. Slack アプリを作成し、Socket Mode を有効化して bot token（`xoxb-...`）と app-level token（`xapp-...`）を取得する。
 2. `config.example.json` を `config.json` にコピーして値を入れ、チャンネル ID などの定数を自分の環境に合わせて書き換える。
+3. `sh hooks/install-pre-push.sh` で公開前ガードを導入する（誤って個人情報・認証情報を push しないため）。
 3. メッセージ取得には [slackcli](https://github.com/shaharia-lab/slackcli) を想定している。
 4. systemd ユニットのパスを自分の配置に直して有効化する。
 
