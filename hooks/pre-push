@@ -11,6 +11,10 @@
 #      private-key headers, AWS access keys)
 #   2b. the diff must not contain a phone-number-like pattern
 #       (added 2026-11-14: Yama's gate covers phone numbers too)
+#   2c. the diff must not contain a generic Slack ID shape
+#       ([UBCTA]0[A-Z0-9]{8,}; added 2026-11-14 from Yama's share:
+#       their scrub is two-layer, enumerated IDs plus this generic
+#       scan as a safety net. EXAMPLE placeholders are allowlisted.)
 #   3. the diff must not contain any email address other than noreply /
 #      placeholder domains (example.*, *.example, *.test, *.invalid,
 #      REPLACE-ME and friends are allowed as dummies)
@@ -62,6 +66,20 @@ while read local_ref local_sha remote_ref remote_sha; do
     if [ -n "$phones" ]; then
       say "blocked: possible phone number in pushed diff:"
       printf '%s\n' "$phones" | sed 's/^/  /' >&2
+      fail=1
+    fi
+    # 2c. generic Slack ID-shape gate (added 2026-11-14: Yama's share in
+    # #slack-へようこそ — their scrub is two-layer: enumerated known IDs
+    # plus a generic `[UC]0[A-Z0-9]{8,}` scan that blocks on a hit.
+    # Our scrub.sed enumerates and check_clean.sh already scans the
+    # tree/history; this adds the same safety net to the push-time gate
+    # so a future unknown ID can't slip through in a diff.
+    # EXAMPLE placeholders are stripped value-level first, so
+    # U0EXAMPLEBOT / C0EXAMPLE001 etc. don't trip it.)
+    ids=$(printf '%s\n' "$scan_diff" | sed 's/EXAMPLE//g' | grep -E -o '[UBCTA]0[A-Z0-9]{8,}' | sort -u || true)
+    if [ -n "$ids" ]; then
+      say "blocked: possible real Slack ID in pushed diff (generic ID shape):"
+      printf '%s\n' "$ids" | sed 's/^/  /' >&2
       fail=1
     fi
     emails=$(printf '%s\n' "$diff" | grep -E -o '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sort -u | grep -v '@users\.noreply\.github\.com$' | grep -v -E '@(example\.com|example\.org|example\.net|example|test|invalid|localhost)$' | grep -v -E '@.*\.(example|test|invalid)$' || true)
