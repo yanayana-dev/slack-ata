@@ -140,6 +140,20 @@ for u in slack-reconcile.service slack-reconcile.timer; do
   fi
 done
 
+# Also restore the DM poll units (added 2026-11-14 with dm_poll.py):
+# without a timer, Ata's own DMs (read through the user-token
+# connector) are never polled, so new DMs would sit unseen.
+dm_poll_reinstalled=0
+for u in slack-dm-poll.service slack-dm-poll.timer; do
+  if ! cmp -s "$BASE/$u" "$DST_DIR/$u"; then
+    if reinstall_unit "$BASE/$u" "$DST_DIR/$u" "$u" slack-dm-poll.timer; then
+      dm_poll_reinstalled=1
+    fi
+  else
+    state_reset "$u"
+  fi
+done
+
 # The timer itself can sit inactive even when every unit file is intact:
 # after a VM replacement timers.target never becomes active (all system
 # timers were dead on 2026-11-13), so `enable` alone does not start it,
@@ -166,6 +180,10 @@ if ! systemctl is-active --quiet slack-reconcile.timer; then
   systemctl start slack-reconcile.timer >/dev/null 2>&1
 fi
 
+if ! systemctl is-active --quiet slack-dm-poll.timer; then
+  systemctl start slack-dm-poll.timer >/dev/null 2>&1
+fi
+
 # A reinstalled unit only takes effect after a restart (daemon-reload
 # alone does not affect the running service), so restart right away and
 # let the next run verify health instead of restarting twice.
@@ -178,6 +196,9 @@ if [ "$watchdog_reinstalled" = 1 ]; then
 fi
 if [ "$reconcile_reinstalled" = 1 ]; then
   systemctl restart slack-reconcile.timer >/dev/null 2>&1
+fi
+if [ "$dm_poll_reinstalled" = 1 ]; then
+  systemctl restart slack-dm-poll.timer >/dev/null 2>&1
 fi
 
 if ! systemctl is-active --quiet "$UNIT"; then

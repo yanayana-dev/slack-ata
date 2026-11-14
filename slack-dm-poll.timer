@@ -1,0 +1,10 @@
+[Unit]
+Description=Run slack-dm-poll every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=slack-dm-poll.service
+
+[Install]
+WantedBy=timers.target
