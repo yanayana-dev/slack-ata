@@ -20,6 +20,27 @@ the live-thread check only blocks when the exact same text is already
 in the thread, which is what a crash-and-retry would resend. Without
 --target-ts the original thread-level behavior is kept.
 
+Windowed read: in target mode the live-thread checks read only from
+60s before the target event onward (adopted 2026-11-14 from Yama's
+share in #slack-へようこそ), instead of re-reading the whole thread
+from the parent. A duplicate of our own reply and another author's
+answer to the target can only exist after the target event, so the
+check's core is unchanged while the read shrinks to a few messages --
+in the 180-reply thread this share arrived in, a full re-read was
+~250KB and nearly failing on connection drops, the main cause of
+reply delay. The 60s margin covers clock skew and near-simultaneous
+posts. Manual posts without an event have no anchor, so they keep
+the full-thread read, as do Yama's. Fail-closed is unchanged: a
+failed read still refuses to send blind.
+Boundary: the parroting guard (duplicate_of_other) now only sees
+posts from the window onward. The realistic vector -- the draft
+picking up the newest post's text (incident 2026-11-14, 21s before
+the target) -- is always inside the window, because the window runs
+to now and the newest post is never older than the target. An
+identical post older than target-60s (e.g. the parent text in an old
+thread) is no longer caught; exact equality with such an old post
+cannot arise from the draft path, which copies the newest post.
+
 Usage:
   reply_once.py --channel C0... --thread-ts 1794471381.083589 --message "..."
   reply_once.py --channel C0... --thread-ts 1794471381.083589 --check-only
@@ -53,6 +74,22 @@ REPLIED = os.path.join(EVENTS, "replied.jsonl")
 AMBIGUOUS = os.path.join(EVENTS, "ambiguous_posts.jsonl")
 
 YANAYANA_USER = "U0EXAMPLEBOT"  # Yanayana bot user id in muse取締役会
+
+# Seconds before the target event a windowed pre-send read starts.
+# Adopted 2026-11-14 from Yama's share in #slack-へようこそ (their
+# pre-send check reads only from 1 minute before the target event to
+# after it): duplicates and answers only exist after the event, so
+# the 60s margin only guards clock skew / near-simultaneous posts.
+WINDOW_MARGIN_SECONDS = 60
+
+
+def window_start(target_ts):
+    """Oldest ts a target-mode pre-send read starts from.
+
+    target_ts is a Slack ts string ("1794642224.439119"); the window
+    opens 60s before it and runs to now (reads are unbounded above).
+    """
+    return f"{float(target_ts) - WINDOW_MARGIN_SECONDS:.6f}"
 
 
 def load_record():
@@ -136,15 +173,21 @@ def thread_read_page_retry(channel, thread_ts, oldest=None, attempts=5):
     raise last_exc
 
 
-def thread_all_messages(channel, thread_ts):
-    """All messages in the live thread, all pages, oldest first."""
+def thread_all_messages(channel, thread_ts, oldest=None):
+    """All messages in the live thread, all pages, oldest first.
+
+    With oldest=None the scan starts at the parent ts (full thread);
+    with oldest set it starts there instead -- the windowed read for
+    target-mode checks (see window_start): paging still walks forward
+    from the given oldest via next_oldest.
+    """
     messages = []
     # Start paging at the parent ts: without --oldest the first page is
     # the parent plus the *latest* replies, and next_oldest then points
     # at the newest message, so later pages come back empty and older
     # replies are never seen. With --oldest=thread_ts the API pages
     # oldest-first and next_oldest walks forward correctly.
-    oldest = thread_ts
+    oldest = oldest or thread_ts
     for page in range(20):  # safety cap: 20 pages x 100 messages
         data = thread_read_page_retry(channel, thread_ts, oldest)
         messages.extend(data.get("messages", []))
@@ -166,18 +209,19 @@ def thread_all_messages(channel, thread_ts):
     return messages
 
 
-def thread_yanayana_replies(channel, thread_ts):
+def thread_yanayana_replies(channel, thread_ts, since_ts=None):
     """(ts, text) of Yanayana's replies in the live thread, all pages.
 
     The parent message itself (ts == thread_ts) does not count, so this
-    also works for threads Yanayana started.
+    also works for threads Yanayana started. With since_ts set, only
+    replies from that ts onward are read (windowed target-mode check).
     """
     return [{"ts": m.get("ts"), "text": m.get("text") or ""}
-            for m in thread_all_messages(channel, thread_ts)
+            for m in thread_all_messages(channel, thread_ts, oldest=since_ts)
             if m.get("user") == YANAYANA_USER and m.get("ts") != thread_ts]
 
 
-def duplicate_of_other(channel, thread_ts, message):
+def duplicate_of_other(channel, thread_ts, message, since_ts=None):
     """Ts of another author's thread message whose text is identical
     to the outgoing message, else None.
 
@@ -188,12 +232,14 @@ def duplicate_of_other(channel, thread_ts, message):
     watches for sending twice to the same target; it never compared
     the outgoing text against other authors' posts. The comparison is
     exact after stripping surrounding whitespace, and the parent
-    message counts too (echoing the question back is not a reply).
+    message counts too (echoing the question back is not a reply) --
+    in windowed mode only when the parent is inside the window (see
+    the module docstring for the boundary).
     """
     if not message or not message.strip():
         return None
     wanted = message.strip()
-    for m in thread_all_messages(channel, thread_ts):
+    for m in thread_all_messages(channel, thread_ts, oldest=since_ts):
         if m.get("user") == YANAYANA_USER:
             continue
         if (m.get("text") or "").strip() == wanted:
@@ -201,20 +247,22 @@ def duplicate_of_other(channel, thread_ts, message):
     return None
 
 
-def thread_yanayana_texts(channel, thread_ts):
+def thread_yanayana_texts(channel, thread_ts, since_ts=None):
     """Texts of Yanayana's replies in the live thread, all pages.
 
     Kept as a thin wrapper over thread_yanayana_replies for callers
     that only need the texts (already_replied's duplicate check).
+    With since_ts set, only replies from that ts onward are read.
     """
-    return [r["text"] for r in thread_yanayana_replies(channel, thread_ts)]
+    return [r["text"] for r in thread_yanayana_replies(channel, thread_ts,
+                                                       since_ts=since_ts)]
 
 
 def thread_has_yanayana_reply(channel, thread_ts):
     return bool(thread_yanayana_texts(channel, thread_ts))
 
 
-def recovery_check(channel, thread_ts, message, attempts=5):
+def recovery_check(channel, thread_ts, message, attempts=5, since_ts=None):
     """After a lost send response, re-read the thread to see whether
     the reply actually landed.
 
@@ -237,7 +285,8 @@ def recovery_check(channel, thread_ts, message, attempts=5):
     """
     for n in range(attempts):
         try:
-            for r in thread_yanayana_replies(channel, thread_ts):
+            for r in thread_yanayana_replies(channel, thread_ts,
+                                             since_ts=since_ts):
                 if r["text"] == message:
                     return r["ts"]
             return False
@@ -390,7 +439,14 @@ def already_replied(channel, thread_ts, target_ts=None, message=None):
     elif in_record(thread_ts):
         return "record"
     try:
-        texts = thread_yanayana_texts(channel, thread_ts)
+        # Target mode reads only the window from 60s before the
+        # target onward (see window_start): a duplicate of our reply
+        # can only exist after the target event, and a same-text reply
+        # to an earlier message is not this reply's duplicate. Manual
+        # mode (no target) has no anchor and keeps the full-thread
+        # read, as Yama's design does for event-less posts.
+        since_ts = window_start(target_ts) if target_ts else None
+        texts = thread_yanayana_texts(channel, thread_ts, since_ts=since_ts)
         if target_ts:
             # Other replies in the thread answer other messages and do
             # not block this one; only the exact same text (what a
@@ -445,6 +501,12 @@ def main(argv):
               "[--target-ts M...] [--message TEXT] [--check-only]", file=sys.stderr)
         return 1
 
+    # Window for this run's target-mode live-thread checks (the
+    # duplicate-text guard and the recovery checks); already_replied
+    # computes the same window itself. None in manual mode: no target
+    # event, so the full thread is read.
+    since_ts = window_start(target_ts) if target_ts else None
+
     found = already_replied(channel, thread_ts, target_ts=target_ts, message=message)
     if found == "unknown":
         print("cannot-verify: thread read failed and no record entry; "
@@ -463,7 +525,8 @@ def main(argv):
                 # the single source of truth for dedupe instead of
                 # relying on the thread scan every time.
                 try:
-                    for r in thread_yanayana_replies(channel, thread_ts):
+                    for r in thread_yanayana_replies(channel, thread_ts,
+                                                     since_ts=since_ts):
                         if r["text"] == message:
                             record_reply(channel, thread_ts, target_ts,
                                          r["ts"], recovered=True,
@@ -479,7 +542,8 @@ def main(argv):
         return 0
 
     try:
-        dup_ts = duplicate_of_other(channel, thread_ts, message)
+        dup_ts = duplicate_of_other(channel, thread_ts, message,
+                                    since_ts=since_ts)
     except Exception as e:
         # Same fail-closed stance as the already-replied check: when
         # the thread cannot be read, do not send blind.
@@ -500,7 +564,8 @@ def main(argv):
         # Confirm from the live thread before deciding anything.
         print(f"warning: send failed ({e}); running recovery check",
               file=sys.stderr)
-        outcome = recovery_check(channel, thread_ts, message)
+        outcome = recovery_check(channel, thread_ts, message,
+                                 since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
                          message=message)
@@ -517,7 +582,8 @@ def main(argv):
         # Send reported success but gave no ts: same recovery flow.
         print("warning: send returned no ts; running recovery check",
               file=sys.stderr)
-        outcome = recovery_check(channel, thread_ts, message)
+        outcome = recovery_check(channel, thread_ts, message,
+                                 since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
                          message=message)
