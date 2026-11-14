@@ -70,7 +70,7 @@ def setup(tmp, name, window_messages, latest_messages, latest_fails=False):
 
     ro.thread_read_page_retry = fake_read
     SENT.clear()
-    ro.send = lambda ch, ts, msg: SENT.append(msg) or "999.9"
+    ro.send = lambda ch, ts, msg, event_id=None: SENT.append(msg) or "999.9"
 
 
 def args(message):

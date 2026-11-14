@@ -12,6 +12,20 @@ Guard: before sending, check both
   (b) the live thread, for an existing Yanayana reply.
 If either shows a reply already exists, nothing is sent.
 
+Metadata-first matching (added 2026-11-14, completing the
+three-way agreement with Yama and Neiro in #slack-へようこそ,
+thread 1794583788.831849): with --event-id, the live-thread check
+first looks for our own metadata stamp (event_type
+"yanayana_reply", event_payload.event_id = the originating Slack
+event_id) via post_metadata.py, and the send itself goes through
+post_metadata.py (direct chat.postMessage with the stamp) instead
+of slackcli. Text matching stays as the second check, so a reply
+sent before the stamp existed is still caught. When the metadata
+read fails, the check falls back to the text check -- which stays
+fail-closed on its own read failure -- rather than blocking a
+reply the text check can verify. Without --event-id (manual posts
+with no originating event) the behaviour is unchanged.
+
 Granularity: with --target-ts (the ts of the message being answered),
 idempotency is per target message -- a reply to a different message in
 the same thread is a new reply, not a duplicate (the thread-only check
@@ -75,6 +89,11 @@ Usage:
     # prints "already-replied" or "not-replied", sends nothing
   reply_once.py --channel C0... --thread-ts T... --target-ts M... --message "..."
     # per-target-message idempotency
+  reply_once.py --channel C0... --thread-ts T... --target-ts M...
+      --event-id Ev... --message "..."
+    # event-driven reply: metadata-stamped send (post_metadata.py)
+    # and metadata-first duplicate check; without --event-id the
+    # slackcli send and text-only check are used (manual posts)
 
 Exit codes: 0 = sent, already replied (no-op), or check completed;
 1 = usage error; 2 = send failed / thread could not be read and no
@@ -99,6 +118,13 @@ import time
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+# Sibling modules (post_metadata) must be importable when this file
+# is loaded by path (importlib spec, as the tests do), not just when
+# run as a script -- the script directory is not sys.path[0] then.
+if BASE not in sys.path:
+    sys.path.insert(0, BASE)
+import post_metadata
+
 SLACKCLI = os.path.join(BASE, "bin", "slackcli")
 EVENTS = os.path.join(BASE, "events")
 REPLIED = os.path.join(EVENTS, "replied.jsonl")
@@ -572,12 +598,43 @@ def record_ambiguous(channel, thread_ts, target_ts, reason, message=None):
     _append_jsonl(AMBIGUOUS, entry)
 
 
-def already_replied(channel, thread_ts, target_ts=None, message=None):
+def metadata_reply_found(channel, thread_ts, event_id):
+    """Ts of our metadata-stamped reply for this event, else None.
+
+    Reads the thread with include_all_metadata and matches our
+    yanayana_reply stamp (post_metadata.find_reply). Raises
+    RuntimeError when the token cannot be resolved or the read
+    fails -- the caller treats that as "metadata check unavailable",
+    not as "not replied", and falls back to the text check.
+    """
+    token = post_metadata.resolve_token()
+    if not token:
+        raise RuntimeError("metadata check: token not found")
+    found = post_metadata.find_reply(channel, thread_ts, token,
+                                     event_id=event_id)
+    return found.get("ts") if found else None
+
+
+def already_replied(channel, thread_ts, target_ts=None, message=None,
+                    event_id=None):
     if target_ts:
         if in_record_for_target(target_ts):
             return "record"
     elif in_record(thread_ts):
         return "record"
+    if event_id:
+        # Metadata first: a stamp proves this event was answered
+        # even when the reply text differs from the draft (e.g. a
+        # retry with edited wording). A failed metadata read falls
+        # back to the text check below, which stays fail-closed on
+        # its own read failure -- the metadata check is an extra
+        # proof channel, not a new single point of failure.
+        try:
+            if metadata_reply_found(channel, thread_ts, event_id):
+                return "thread"
+        except Exception as e:
+            print(f"warning: metadata check failed ({e}); falling back "
+                  f"to text check", file=sys.stderr)
     try:
         # Target mode reads only the window from 60s before the
         # target onward (see window_start): a duplicate of our reply
@@ -604,7 +661,22 @@ def already_replied(channel, thread_ts, target_ts=None, message=None):
     return None
 
 
-def send(channel, thread_ts, message):
+def send(channel, thread_ts, message, event_id=None):
+    """Send one thread reply; returns the sent message's ts.
+
+    With event_id the reply is stamped with metadata (event_type
+    "yanayana_reply", event_payload.event_id = the originating Slack
+    event_id) via post_metadata.py, so a later run can match it by
+    stamp. Without one (manual posts, no originating event) the
+    slackcli path is used as before. Raises RuntimeError on failure
+    so the caller runs its lost-response recovery check.
+    """
+    if event_id:
+        ok, result = post_metadata.send_reply(channel, thread_ts,
+                                              message, event_id=event_id)
+        if not ok:
+            raise RuntimeError(f"post_metadata send failed: {result}")
+        return result.get("ts") or result.get("message", {}).get("ts")
     r = subprocess.run(
         [SLACKCLI, "messages", "send", "--recipient-id", channel,
          "--thread-ts", thread_ts, "--message", message, "--json"],
@@ -618,7 +690,7 @@ def send(channel, thread_ts, message):
 
 
 def main(argv):
-    channel = thread_ts = message = target_ts = None
+    channel = thread_ts = message = target_ts = event_id = None
     check_only = False
     i = 0
     while i < len(argv):
@@ -629,6 +701,8 @@ def main(argv):
             thread_ts = argv[i + 1]; i += 2
         elif a == "--target-ts" and i + 1 < len(argv):
             target_ts = argv[i + 1]; i += 2
+        elif a == "--event-id" and i + 1 < len(argv):
+            event_id = argv[i + 1]; i += 2
         elif a == "--message" and i + 1 < len(argv):
             message = argv[i + 1]; i += 2
         elif a == "--check-only":
@@ -638,7 +712,8 @@ def main(argv):
             return 1
     if not channel or not thread_ts or (not check_only and not message):
         print("usage: reply_once.py --channel C... --thread-ts T... "
-              "[--target-ts M...] [--message TEXT] [--check-only]", file=sys.stderr)
+              "[--target-ts M...] [--event-id Ev...] [--message TEXT] "
+              "[--check-only]", file=sys.stderr)
         return 1
 
     # Window for this run's target-mode live-thread checks (the
@@ -647,7 +722,8 @@ def main(argv):
     # event, so the full thread is read.
     since_ts = window_start(target_ts) if target_ts else None
 
-    found = already_replied(channel, thread_ts, target_ts=target_ts, message=message)
+    found = already_replied(channel, thread_ts, target_ts=target_ts,
+                            message=message, event_id=event_id)
     if found == "unknown":
         print("cannot-verify: thread read failed and no record entry; "
               "refusing to send", file=sys.stderr)
@@ -710,7 +786,7 @@ def main(argv):
 
     reply_ts = None
     try:
-        reply_ts = send(channel, thread_ts, message)
+        reply_ts = send(channel, thread_ts, message, event_id=event_id)
     except Exception as e:
         # The send response was lost: the reply may still have landed.
         # Confirm from the live thread before deciding anything.

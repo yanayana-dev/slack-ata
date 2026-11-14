@@ -26,9 +26,13 @@ so either ledger's check blocks a later duplicate.
 
 Usage:
   send_reply_locked.py --channel C... --thread-ts T... --target-ts M...
-                       --message "..." [--dry-run]
+                       --message "..." [--event-id Ev...] [--dry-run]
   --dry-run acquires the lock and runs the checks, then reports
   what would be sent without sending.
+  --event-id is passed through to reply_once.py: the reply is then
+  sent metadata-stamped via post_metadata.py and the pre-send
+  check looks for our metadata stamp first (see reply_once.py).
+  Without it the slackcli send and text-only check are used.
 
 Exit codes: 0 = sent, already-replied (no-op), dry-run ok, or a
 duplicate-text/own-ledger guard refused the send (nothing was sent);
@@ -55,7 +59,7 @@ def run(cmd):
 
 
 def main(argv):
-    channel = thread_ts = target_ts = message = None
+    channel = thread_ts = target_ts = message = event_id = None
     dry_run = False
     i = 0
     while i < len(argv):
@@ -66,6 +70,8 @@ def main(argv):
             thread_ts = argv[i + 1]; i += 2
         elif a == "--target-ts" and i + 1 < len(argv):
             target_ts = argv[i + 1]; i += 2
+        elif a == "--event-id" and i + 1 < len(argv):
+            event_id = argv[i + 1]; i += 2
         elif a == "--message" and i + 1 < len(argv):
             message = argv[i + 1]; i += 2
         elif a == "--dry-run":
@@ -75,7 +81,8 @@ def main(argv):
             return 1
     if not channel or not thread_ts or not target_ts or (not dry_run and not message):
         print("usage: send_reply_locked.py --channel C... --thread-ts T... "
-              "--target-ts M... --message TEXT [--dry-run]", file=sys.stderr)
+              "--target-ts M... --message TEXT [--event-id Ev...] "
+              "[--dry-run]", file=sys.stderr)
         return 1
 
     os.makedirs(EVENTS, exist_ok=True)
@@ -84,12 +91,14 @@ def main(argv):
     with open(LOCK_PATH, "a+", encoding="utf-8") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         try:
-            return _send_locked(channel, thread_ts, target_ts, message, dry_run)
+            return _send_locked(channel, thread_ts, target_ts, message,
+                                dry_run, event_id)
         finally:
             fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
-def _send_locked(channel, thread_ts, target_ts, message, dry_run):
+def _send_locked(channel, thread_ts, target_ts, message, dry_run,
+                 event_id=None):
     # 1. replylog ledger (events/replies.jsonl, the hook flow's ledger).
     r = run([sys.executable, REPLYLOG, "check", "--target-ts", target_ts])
     if r.returncode != 0:
@@ -104,10 +113,15 @@ def _send_locked(channel, thread_ts, target_ts, message, dry_run):
 
     # 2. reply_once.py: its replied.jsonl record + live-thread
     # same-text check, the parroting guards, the send, and the
-    # lost-response recovery -- all inside this lock.
-    r = run([sys.executable, REPLY_ONCE, "--channel", channel,
-             "--thread-ts", thread_ts, "--target-ts", target_ts,
-             "--message", message])
+    # lost-response recovery -- all inside this lock. With
+    # --event-id the send is metadata-stamped (post_metadata.py)
+    # and the pre-send check looks for the stamp first.
+    cmd = [sys.executable, REPLY_ONCE, "--channel", channel,
+           "--thread-ts", thread_ts, "--target-ts", target_ts,
+           "--message", message]
+    if event_id:
+        cmd += ["--event-id", event_id]
+    r = run(cmd)
     out = (r.stdout or "").strip()
     err = (r.stderr or "").strip()
     if r.returncode == 0 and "already-replied" in out:

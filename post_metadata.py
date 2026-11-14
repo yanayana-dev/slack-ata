@@ -36,8 +36,11 @@ The bot token is read from slackcli's auth store
 or written anywhere new.
 
 This module only sends and reads; it does not decide whether a
-reply is a duplicate and does not write any ledger. Integration
-into the live send path happens separately.
+reply is a duplicate and does not write any ledger. It is wired
+into the live send path through reply_once.py --event-id (and
+send_reply_locked.py --event-id): event-driven replies go through
+here with their originating event_id, manual posts keep the
+slackcli path.
 
 Usage:
   post_metadata.py --channel C... --thread-ts T... --message "..."

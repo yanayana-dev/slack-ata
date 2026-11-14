@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -67,7 +69,8 @@ MESSAGE = "test reply text"
 
 def setup_tmp():
     tmp = tempfile.mkdtemp(prefix="sendlock-test-")
-    for name in ("send_reply_locked.py", "reply_once.py", "replylog.py"):
+    for name in ("send_reply_locked.py", "reply_once.py", "replylog.py",
+                 "post_metadata.py"):
         shutil.copy(os.path.join(ROOT, name), os.path.join(tmp, name))
     os.makedirs(os.path.join(tmp, "bin"))
     os.makedirs(os.path.join(tmp, "events"))
@@ -80,13 +83,18 @@ def setup_tmp():
     return tmp
 
 
-def run_wrapper(tmp, target=TARGET_TS, message=MESSAGE, extra=None):
+def run_wrapper(tmp, target=TARGET_TS, message=MESSAGE, extra=None,
+                env_extra=None):
     cmd = [sys.executable, os.path.join(tmp, "send_reply_locked.py"),
            "--channel", CHANNEL, "--thread-ts", THREAD_TS,
            "--target-ts", target, "--message", message]
     if extra:
         cmd += extra
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                          env=env)
 
 
 def count_lines(path):
@@ -95,6 +103,110 @@ def count_lines(path):
             return sum(1 for line in f if line.strip())
     except FileNotFoundError:
         return 0
+
+
+class StubSlackAPI(BaseHTTPRequestHandler):
+    """Minimal Slack API stub for the metadata path: reads return the
+    parent only (no stamp yet); posts record their payload and
+    return a fresh ts. post_metadata.py talks to it via
+    SLACK_API_BASE, with the token from a fake store file."""
+
+    posts = []
+    reads = []
+
+    def log_message(self, *args):
+        pass
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        StubSlackAPI.reads.append(parsed.path)
+        if parsed.path.endswith("/conversations.replies"):
+            self._json({"ok": True,
+                        "messages": [{"ts": THREAD_TS,
+                                      "thread_ts": THREAD_TS,
+                                      "user": "U0OTHER",
+                                      "text": "parent"}],
+                        "has_more": False})
+        else:
+            self._json({"ok": False, "error": "unknown_method"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        StubSlackAPI.posts.append(body)
+        if self.path.endswith("/chat.postMessage"):
+            self._json({"ok": True, "ts": "5000.000001",
+                        "channel": CHANNEL})
+        else:
+            self._json({"ok": False, "error": "unknown_method"})
+
+
+def test_metadata_end_to_end(tmp):
+    """--event-id through the locked wrapper: the reply is sent via
+    the stub API with the yanayana_reply stamp, both ledgers record
+    it, and a re-run sends nothing more."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StubSlackAPI)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        StubSlackAPI.posts = []
+        StubSlackAPI.reads = []
+        store = os.path.join(tmp, "store.json")
+        with open(store, "w", encoding="utf-8") as f:
+            json.dump({"workspaces": {"muse-board": {"token": "fake-test-token"}},
+                       "default_workspace": "muse-board"}, f)
+        env_extra = {
+            "SLACK_API_BASE": f"http://127.0.0.1:{port}/api",
+            "POST_METADATA_STORE": store,
+        }
+        sends_log = os.path.join(tmp, "events", "fake_sends.log")
+        replies = os.path.join(tmp, "events", "replies.jsonl")
+        replied = os.path.join(tmp, "events", "replied.jsonl")
+        before_posts = len(StubSlackAPI.posts)
+        r = run_wrapper(tmp, target="6000.000000", message="meta reply",
+                        extra=["--event-id", "Ev0TEST00001"],
+                        env_extra=env_extra)
+        check("metadata run exits 0",
+              r.returncode == 0,
+              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:200]}")
+        check("metadata run posts exactly once via the API",
+              len(StubSlackAPI.posts) - before_posts == 1,
+              f"posts={len(StubSlackAPI.posts) - before_posts}")
+        check("metadata run does not use the slackcli send path",
+              count_lines(sends_log) == 1,
+              f"sends={count_lines(sends_log)}")
+        if StubSlackAPI.posts:
+            payload = StubSlackAPI.posts[-1]
+            check("posted payload carries the yanayana_reply stamp",
+                  payload.get("metadata") == {
+                      "event_type": "yanayana_reply",
+                      "event_payload": {"event_id": "Ev0TEST00001"}},
+                  f"metadata={payload.get('metadata')}")
+            check("posted payload is in the right thread",
+                  payload.get("channel") == CHANNEL
+                  and payload.get("thread_ts") == THREAD_TS)
+        check("metadata run records both ledgers",
+              count_lines(replies) == 3 and count_lines(replied) == 2,
+              f"replies={count_lines(replies)} replied={count_lines(replied)}")
+        r2 = run_wrapper(tmp, target="6000.000000", message="meta reply",
+                         extra=["--event-id", "Ev0TEST00001"],
+                         env_extra=env_extra)
+        check("metadata re-run exits 0 without reposting",
+              r2.returncode == 0 and "already-replied" in r2.stdout
+              and len(StubSlackAPI.posts) - before_posts == 1,
+              f"rc={r2.returncode} out={r2.stdout.strip()}")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def main():
@@ -150,6 +262,9 @@ def main():
               r.returncode == 0 and "already-replied (replylog)" in r.stdout
               and count_lines(sends_log) == 1,
               f"rc={r.returncode} out={r.stdout.strip()}")
+
+        # 5. Metadata path end to end (stub Slack API).
+        test_metadata_end_to_end(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

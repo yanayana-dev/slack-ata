@@ -59,7 +59,7 @@ def setup(tmp, name, ledger_rows):
     ro.thread_read_page_retry = lambda ch, ts, oldest=None: {
         "messages": [PARENT], "has_more": False}
     SENT.clear()
-    ro.send = lambda ch, ts, msg: SENT.append(msg) or "999.9"
+    ro.send = lambda ch, ts, msg, event_id=None: SENT.append(msg) or "999.9"
 
 
 def ledger_entry(thread_ts, text, reply_ts="555.5"):
