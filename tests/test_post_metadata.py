@@ -101,6 +101,8 @@ class FakeUrlopen:
                                         headers, io.BytesIO(b"{}"))
         if kind[0] == "network":
             raise urllib.error.URLError("fake connection reset")
+        if kind[0] == "timeout":
+            raise TimeoutError("fake timed out")
         if kind[0] == "badjson":
             return FakeResponse(kind[1])
         raise AssertionError("unknown outcome %r" % (kind,))
@@ -165,18 +167,20 @@ def test_post_success_and_headers():
 def test_post_retries():
     fake = FakeUrlopen([
         ("http", 429, {"ok": False, "error": "ratelimited"}, {"Retry-After": "0"}),
-        ("http", 500, {"ok": False}, {}),
         ("ok", {"ok": True, "ts": "1794660000.222222"}),
     ])
     ok, result = post_metadata.post(
         post_metadata.build_payload(CHANNEL, "hi", THREAD_TS, event_id=EVENT_ID),
         FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
-    check("post retries 429 then 500 and succeeds",
+    check("post retries 429 and succeeds",
           ok and result.get("ts") == "1794660000.222222"
-          and len(fake.calls) == 3, f"calls={len(fake.calls)}")
+          and len(fake.calls) == 2, f"calls={len(fake.calls)}")
     check("429 honors Retry-After 0", fake.sleeps and fake.sleeps[0] == 0.0,
           f"sleeps={fake.sleeps}")
 
+    # A lost response may mean the post already landed (Neiro's
+    # 2026-11-15 triple post): a network error on a POST must not
+    # be blind-resent.
     fake = FakeUrlopen([
         ("network",),
         ("ok", {"ok": True, "ts": "1794660000.333333"}),
@@ -184,8 +188,8 @@ def test_post_retries():
     ok, result = post_metadata.post(
         post_metadata.build_payload(CHANNEL, "hi", THREAD_TS, event_id=EVENT_ID),
         FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
-    check("post retries a network error and succeeds",
-          ok and len(fake.calls) == 2, f"calls={len(fake.calls)}")
+    check("post never retries a network error (may already have landed)",
+          not ok and len(fake.calls) == 1, f"calls={len(fake.calls)}")
 
 
 def test_post_no_retry():
@@ -215,16 +219,26 @@ def test_post_no_retry():
     ok, reason = post_metadata.post(
         post_metadata.build_payload(CHANNEL, "hi", THREAD_TS, event_id=EVENT_ID),
         FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
-    check("post gives up after 3 attempts on persistent 500",
-          not ok and reason == "http_500" and len(fake.calls) == 3,
+    check("post never retries a 500 (may already have landed)",
+          not ok and reason == "http_500" and len(fake.calls) == 1,
           f"calls={len(fake.calls)} reason={reason}")
 
     fake = FakeUrlopen([("network",)] * 3)
     ok, reason = post_metadata.post(
         post_metadata.build_payload(CHANNEL, "hi", THREAD_TS, event_id=EVENT_ID),
         FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
-    check("post gives up after 3 network failures",
-          not ok and reason.startswith("network:") and len(fake.calls) == 3)
+    check("post never retries a network failure (may already have landed)",
+          not ok and reason.startswith("network:") and len(fake.calls) == 1)
+
+    # Timeout shares the network-error path in _request_json
+    # (URLError/TimeoutError/OSError -> no retry on POST), but had no
+    # outcome of its own: a timed-out POST may also have landed.
+    fake = FakeUrlopen([("timeout",)] * 3)
+    ok, reason = post_metadata.post(
+        post_metadata.build_payload(CHANNEL, "hi", THREAD_TS, event_id=EVENT_ID),
+        FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
+    check("post never retries a timeout (may already have landed)",
+          not ok and reason.startswith("network:") and len(fake.calls) == 1)
 
 
 def test_find_by_metadata():

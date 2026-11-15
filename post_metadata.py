@@ -21,8 +21,16 @@ event_id / request_id) first, exact text match second -- text
 matching stays in reply_once.py; this module only does the
 metadata-first lookup.
 
-Retry policy (agreed three-way): retry only on HTTP 429, 5xx and
-network errors, up to 3 attempts with backoff 1s, 2s (429 honors
+Retry policy (revised 2026-11-15 from Neiro's triple-post fix in
+#slack-へようこそ): a POST retries only on HTTP 429 -- Slack
+rejected the call before receiving it, so a resend cannot
+duplicate. Network errors, timeouts and 5xx are NOT retried on a
+POST: the post may already have landed and only the response was
+lost (that is exactly how Neiro's identical reply was posted
+three times). Arrival is then checked by the caller via the
+thread history / metadata stamp (reply_once.py, reconcile_ambiguous.py).
+GET reads are idempotent, so they still retry 429, 5xx and network
+errors, up to 3 attempts with backoff 1s, 2s (429 honors
 Retry-After). Never retry when the API returns ok:false -- a
 rejected call is a verdict, not a transient failure. This is
 deliberately stricter than Neiro's reference, which also retries a
@@ -170,8 +178,13 @@ def build_payload(channel, text, thread_ts=None, event_id=None,
     return payload
 
 
-def _is_retryable_http(code):
-    return code == 429 or code >= 500
+def _is_retryable_http(code, method):
+    # 429: Slack rejected the call before receiving it, so a resend
+    # cannot duplicate -- retryable for any method. 5xx on a GET
+    # read is also retryable (reads are idempotent); on a POST it
+    # is not, because the post may already have landed and only the
+    # response was lost (Neiro's 2026-11-15 triple post).
+    return code == 429 or (method == "GET" and code >= 500)
 
 
 def _wait_for_retry(attempt, retry_after):
@@ -192,7 +205,11 @@ def _request_json(url, token, data=None, method="GET",
     Returns the parsed JSON dict. Raises RuntimeError on final
     failure: retryable errors are retried up to MAX_ATTEMPTS; other
     HTTP errors and ok:false are returned/raised immediately without
-    retry, as is a non-JSON 200 body.
+    retry, as is a non-JSON 200 body. On a POST, only HTTP 429 is
+    retryable -- network errors, timeouts and 5xx are raised at
+    once, because the post may already have landed and only the
+    response was lost; the caller then checks arrival via the
+    thread history / metadata stamp instead of blind-resending.
     """
     if urlopen is None:
         urlopen = urllib.request.urlopen
@@ -219,13 +236,16 @@ def _request_json(url, token, data=None, method="GET",
                 except AttributeError:
                     pass
         except urllib.error.HTTPError as e:
-            if _is_retryable_http(e.code) and attempt < MAX_ATTEMPTS:
+            if _is_retryable_http(e.code, method) and attempt < MAX_ATTEMPTS:
                 sleep(_wait_for_retry(attempt, _header_retry_after(e)))
                 continue
             raise RuntimeError("http_%d" % e.code)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_error = e
-            if attempt < MAX_ATTEMPTS:
+            # GET reads are idempotent, so a lost read response is
+            # safe to retry. A POST is not: the post may already
+            # have landed (Neiro's 2026-11-15 triple post).
+            if method == "GET" and attempt < MAX_ATTEMPTS:
                 sleep(_wait_for_retry(attempt, None))
                 continue
             raise RuntimeError("network: %s" % e)

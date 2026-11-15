@@ -33,6 +33,11 @@ STATE_FILE=${WATCHDOG_STATE_FILE:-$BASE/events/watchdog_reinstall.state}
 MAX_ATTEMPTS=3
 BACKOFF_BASE=30
 
+# Hook health check (adopted 2026-11-15 from Neiro's check-script share):
+# syntax of ~/hooks/scripts/*.sh and JSON of ~/hooks/definitions/*.json;
+# warns to Slack on new/changed failures. Never blocks the watchdog.
+"$BASE/check_hooks.sh" >/dev/null 2>&1 || true
+
 # --- reinstall attempt state: lines "name count next_allowed_epoch" ---
 state_get() { # name -> "count next_allowed" (defaults 0 0)
   if [ -f "$STATE_FILE" ]; then
