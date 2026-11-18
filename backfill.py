@@ -54,6 +54,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import seen_state
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = os.path.join(BASE, "events")
 INBOX = os.path.join(EVENTS, "inbox.jsonl")
@@ -102,18 +104,15 @@ def run_slackcli(args, timeout=60):
 
 
 def load_seen():
-    try:
-        with open(SEEN_PATH, "r", encoding="utf-8") as f:
-            return [str(x) for x in json.load(f)][-SEEN_MAX:]
-    except Exception:
-        return []
+    # Seen file with .bak fallback (seen_state.py): a corrupt or
+    # deleted main file recovers from the backup copy instead of
+    # silently starting empty.
+    return seen_state.load_seen(SEEN_PATH)[-SEEN_MAX:]
 
 
 def save_seen(order):
-    tmp = SEEN_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(order[-SEEN_MAX:], f)
-    os.replace(tmp, SEEN_PATH)
+    # Keeps the previous good file as .bak before replacing it.
+    seen_state.save_seen(order[-SEEN_MAX:], SEEN_PATH)
 
 
 def compute_floor(seen_order, floor_arg=None, window_minutes=None, now=None):

@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 
 import dm_poll
+import seen_state
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
@@ -190,14 +191,11 @@ def main():
     # Event-ID dedupe (agy review point 2): Slack can redeliver events;
     # remember recent event_ids plus channel:ts keys on disk so a restart
     # does not re-admit duplicates.
-    seen_order = []
-    seen_set = set()
-    try:
-        with open(SEEN_PATH, "r", encoding="utf-8") as f:
-            seen_order = [str(x) for x in json.load(f)][-SEEN_MAX:]
-            seen_set = set(seen_order)
-    except Exception:
-        seen_order, seen_set = [], set()
+    # Seen file with .bak fallback (seen_state.py): a corrupt or
+    # deleted main file recovers from the backup copy instead of
+    # silently starting empty.
+    seen_order = seen_state.load_seen(SEEN_PATH)[-SEEN_MAX:]
+    seen_set = set(seen_order)
 
     def remember(*keys):
         changed = False
@@ -211,8 +209,9 @@ def main():
         while len(seen_order) > SEEN_MAX:
             seen_set.discard(seen_order.pop(0))
         try:
-            with open(SEEN_PATH, "w", encoding="utf-8") as f:
-                json.dump(seen_order, f)
+            # Atomic write that also keeps the previous good file as
+            # .bak (seen_state.py).
+            seen_state.save_seen(seen_order, SEEN_PATH)
         except Exception:
             pass
 
@@ -224,8 +223,7 @@ def main():
         # event_id (observed 2026-11-12: same ts in the inbox twice,
         # once with event_id null from backfill, once with an event_id).
         try:
-            with open(SEEN_PATH, "r", encoding="utf-8") as f:
-                disk = [str(x) for x in json.load(f)]
+            disk = seen_state.load_seen(SEEN_PATH)
         except Exception:
             return
         for key in disk:
