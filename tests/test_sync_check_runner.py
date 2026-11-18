@@ -41,9 +41,13 @@ def check(name, cond):
         print(f"FAIL {name}")
 
 
+# Fake scrub rules for the temp Env. NOTE: this file is published to the
+# public repo, so fixtures must use EXAMPLE placeholders only -- never a
+# real channel ID or the real home path (a real ID slipped in here once
+# and was caught by the pre-push guard on 2026-11-19 before pushing).
 SCRUB_RULES = (
-    "s/C0EXAMPLE001/C0EXAMPLE001/g\n"
-    "s|/path/to/slack-watcher|/path/to/slack-watcher|g\n"
+    "s/C0EXAMPLE002/C0EXAMPLE001/g\n"
+    "s|/home/example/workspace/slack-listener|/path/to/slack-watcher|g\n"
     "s/slack-listener/slack-listener/g\n"
 )
 
