@@ -1,0 +1,16 @@
+[Unit]
+Description=Auto-join new public Slack channels as Yanayana (auto_join_channels.py)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/path/to/slack-watcher/proxy.env
+Environment=HOME=/path/to
+# slackcli is a Bun binary: without NODE_USE_ENV_PROXY it ignores the
+# proxy variables, tries direct TLS, and hangs retrying against the
+# intercepting egress proxy (SSL WRONG_VERSION_NUMBER). Found
+# 2026-11-18 on the first systemd runs; the agent shell has this set,
+# which is why manual runs always worked.
+Environment=NODE_USE_ENV_PROXY=1
+TimeoutStartSec=300
+WorkingDirectory=/path/to/slack-watcher
+ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/auto_join_channels.py

@@ -38,6 +38,12 @@ BACKOFF_BASE=30
 # warns to Slack on new/changed failures. Never blocks the watchdog.
 "$BASE/check_hooks.sh" >/dev/null 2>&1 || true
 
+# Auto-join of new public channels moved out of this watchdog on
+# 2026-11-18 (あた's choice: keep the heavy checks at 5 minutes, run
+# only the light auto-join every minute): it now runs on its own
+# slack-auto-join.timer; this watchdog only restores and starts
+# those units below, like the DM poll units.
+
 # --- reinstall attempt state: lines "name count next_allowed_epoch" ---
 state_get() { # name -> "count next_allowed" (defaults 0 0)
   if [ -f "$STATE_FILE" ]; then
@@ -159,6 +165,20 @@ for u in slack-dm-poll.service slack-dm-poll.timer; do
   fi
 done
 
+# Also restore the auto-join units (added 2026-11-18): without the
+# 1-minute timer, new public channels are no longer joined
+# automatically and the bot would silently miss new channels.
+auto_join_reinstalled=0
+for u in slack-auto-join.service slack-auto-join.timer; do
+  if ! cmp -s "$BASE/$u" "$DST_DIR/$u"; then
+    if reinstall_unit "$BASE/$u" "$DST_DIR/$u" "$u" slack-auto-join.timer; then
+      auto_join_reinstalled=1
+    fi
+  else
+    state_reset "$u"
+  fi
+done
+
 # The timer itself can sit inactive even when every unit file is intact:
 # after a VM replacement timers.target never becomes active (all system
 # timers were dead on 2026-11-13), so `enable` alone does not start it,
@@ -189,6 +209,10 @@ if ! systemctl is-active --quiet slack-dm-poll.timer; then
   systemctl start slack-dm-poll.timer >/dev/null 2>&1
 fi
 
+if ! systemctl is-active --quiet slack-auto-join.timer; then
+  systemctl start slack-auto-join.timer >/dev/null 2>&1
+fi
+
 # A reinstalled unit only takes effect after a restart (daemon-reload
 # alone does not affect the running service), so restart right away and
 # let the next run verify health instead of restarting twice.
@@ -204,6 +228,9 @@ if [ "$reconcile_reinstalled" = 1 ]; then
 fi
 if [ "$dm_poll_reinstalled" = 1 ]; then
   systemctl restart slack-dm-poll.timer >/dev/null 2>&1
+fi
+if [ "$auto_join_reinstalled" = 1 ]; then
+  systemctl restart slack-auto-join.timer >/dev/null 2>&1
 fi
 
 if ! systemctl is-active --quiet "$UNIT"; then

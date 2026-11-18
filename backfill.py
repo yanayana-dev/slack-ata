@@ -18,7 +18,7 @@ the state machine uses, so re-adding is a no-op. The listener's own
 dedupe (same seen file) also keeps it from re-admitting a backfilled
 message if Slack redelivers it.
 
-Usage: backfill.py [--limit N] [--floor-epoch SECONDS]
+Usage: backfill.py [--limit N] [--floor-epoch SECONDS] [--window-minutes N] [--channel ID ...]
 Prints a JSON summary: {"recovered": n, "checked": n, "errors": [...]}
 --floor-epoch sets the floor explicitly (epoch seconds; messages at or
 below it are skipped). Without it, an empty seen file means "first run":
@@ -26,6 +26,26 @@ the floor defaults to now, so the first run never replays history --
 backfill only recovers messages missed during downtime, and on a first
 run there is no downtime to recover from (adopted 2026-11-14 from
 Neiro's review of the published code).
+--window-minutes sets the floor to now minus N minutes instead of the
+newest seen message (adopted 2026-11-18 from Neiro's fix
+neiro-slack-system 96f8597): for a just-joined channel the gap posts
+are newer than the window even when another channel has a newer seen
+message, which the global newest-seen floor would wrongly skip. The
+auto-join path passes 15 (watchdog interval is 5 minutes, so 15 covers
+the gap with margin). Explicit --floor-epoch still wins over the
+window. Already-seen messages are skipped either way.
+--channel restricts the run to the given channel(s) (repeatable); this
+is how auto_join_channels.py recovers messages posted in a new channel
+between its creation and the bot joining it (up to one 5-minute
+watchdog interval later) -- Yama's 2026-11-18 point that the gap would
+otherwise be missed. Without --channel, CHANNELS above is used.
+Unlike Neiro's v1 seed, this backfill also reads thread replies
+(messages with reply_count are followed into their threads), so a
+gap-time thread reply is recovered too. Thread re-reads pass
+--oldest <floor> (adopted 2026-11-18 from Neiro's
+neiro-slack-system 6980acd): without it a thread with more than 100
+replies returns only one page and newer replies past the page can be
+dropped; with the floor, only replies newer than the floor come back.
 """
 import json
 import os
@@ -45,6 +65,7 @@ SLACKCLI = os.path.join(BASE, "bin", "slackcli")
 CHANNELS = [
     "C0EXAMPLE001",  # #slack-へようこそ
     "C0EXAMPLE002",  # #all-muse取締役会
+    "C0EXAMPLE004",  # #yamaguchi勉強応援
 ]
 
 # Yanayana itself: its posts must never enter the inbox (bot-loop guard,
@@ -95,6 +116,40 @@ def save_seen(order):
     os.replace(tmp, SEEN_PATH)
 
 
+def compute_floor(seen_order, floor_arg=None, window_minutes=None, now=None):
+    """Floor (epoch seconds) below which messages are skipped.
+
+    Precedence: explicit --floor-epoch wins; then --window-minutes
+    (now minus the window); then the newest ts in the seen file; then
+    now on a first run (no seen ts keys). The window matters for a
+    just-joined channel: the global newest-seen floor is set by
+    whatever channel was busiest, so it can sit above the joined
+    channel's gap posts and skip them. A time window relative to now
+    does not have that cross-channel leak.
+    """
+    if floor_arg is not None:
+        return floor_arg
+    if now is None:
+        now = time.time()
+    if window_minutes is not None:
+        return now - window_minutes * 60
+    floor = 0.0
+    for key in seen_order:
+        if key.startswith("ts:"):
+            try:
+                floor = max(floor, float(key.rsplit(":", 1)[1]))
+            except ValueError:
+                pass
+    if floor == 0.0:
+        # No seen ts keys (first run, or the seen file was lost): the
+        # old floor=0 admitted the last 100 messages wholesale.
+        # Default to now instead -- there is no downtime window to
+        # recover, so nothing is re-admitted. Pass --floor-epoch
+        # explicitly to recover from a known point in time.
+        floor = now
+    return floor
+
+
 def append_inbox(record):
     os.makedirs(EVENTS, exist_ok=True)
     with open(INBOX, "a", encoding="utf-8") as f:
@@ -113,28 +168,26 @@ def main():
             floor_arg = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else None
         except ValueError:
             floor_arg = None
+    window_minutes = None
+    if "--window-minutes" in sys.argv:
+        i = sys.argv.index("--window-minutes")
+        try:
+            window_minutes = float(sys.argv[i + 1]) if i + 1 < len(sys.argv) else None
+        except ValueError:
+            window_minutes = None
+    channels = CHANNELS
+    if "--channel" in sys.argv:
+        channels = [a for j, a in enumerate(sys.argv)
+                    if j > 0 and sys.argv[j - 1] == "--channel" and a]
+        if not channels:
+            channels = CHANNELS
 
     seen_order = load_seen()
     seen_set = set(seen_order)
-    # Floor: only messages newer than the newest message the listener has
-    # already seen can be "missed during downtime". Anything older predates
-    # the watcher (or was already handled by hand) and must not be re-added.
-    floor = 0.0
-    for key in seen_order:
-        if key.startswith("ts:"):
-            try:
-                floor = max(floor, float(key.rsplit(":", 1)[1]))
-            except ValueError:
-                pass
-    if floor_arg is not None:
-        floor = floor_arg
-    elif floor == 0.0:
-        # No seen ts keys (first run, or the seen file was lost): the
-        # old floor=0 admitted the last 100 messages wholesale. Default
-        # to now instead -- there is no downtime window to recover, so
-        # nothing is re-admitted. Pass --floor-epoch explicitly to
-        # recover from a known point in time.
-        floor = time.time()
+    # Floor: only messages newer than the floor can be "missed during
+    # downtime". Anything older predates the watcher (or was already
+    # handled by hand) and must not be re-added.
+    floor = compute_floor(seen_order, floor_arg, window_minutes)
     recovered = 0
     checked = 0
     errors = []
@@ -180,7 +233,7 @@ def main():
         seen_order.append(key)
         recovered += 1
 
-    for channel in CHANNELS:
+    for channel in channels:
         try:
             data = run_slackcli(
                 ["conversations", "read", channel,
@@ -195,9 +248,15 @@ def main():
                 threads.append(msg["ts"])
         for ts in threads:
             try:
+                # --oldest <floor> (adopted 2026-11-18 from Neiro's
+                # neiro-slack-system 6980acd): without it a thread
+                # with more than 100 replies returns only one page,
+                # and new replies past the page can be dropped. The
+                # floor is exclusive, matching admit()'s ts <= floor
+                # skip, so no reply is lost or double-counted.
                 tdata = run_slackcli(
                     ["conversations", "read", channel,
-                     "--thread-ts", ts, "--json"])
+                     "--thread-ts", ts, "--oldest", str(floor), "--json"])
             except Exception as e:
                 errors.append(f"{channel} thread {ts}: {e}")
                 continue
