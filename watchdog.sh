@@ -273,4 +273,31 @@ age=$(( now - hb_mtime ))
 if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
   systemctl restart "$UNIT" >/dev/null 2>&1
 fi
+
+# Stale-pending warning (agy review 2026-11-18, thread 1795006461.907139):
+# the hook itself cannot notice when it has stopped -- an event-driven
+# hook cannot run to report its own death -- so this timer-driven
+# watchdog checks the oldest unprocessed inbox message. The threshold
+# is 180s, deliberately later than the 120s heartbeat restart above,
+# so the warning is an escalation for "the restart did not fix it",
+# not a pre-warning (a transient flap must not cry wolf). Dedup is one
+# flag file: created when a warning is sent, removed when the queue
+# drains, so an unresolved stall warns once and a self-recovery resets
+# the latch (no hash state file needed). Never blocks the watchdog:
+# every step is best-effort and the script still exits 0 below.
+STALL_FLAG=${WATCHDOG_STALL_FLAG:-$BASE/events/pending_stall.flag}
+STALL_THRESHOLD=${WATCHDOG_STALL_THRESHOLD:-180}
+STALL_CHANNEL=${WATCHDOG_STALL_CHANNEL:-C0EXAMPLE001}
+stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "")
+if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
+  if [ ! -f "$STALL_FLAG" ]; then
+    stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
+    if "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
+      mkdir -p "$(dirname "$STALL_FLAG")"
+      touch "$STALL_FLAG"
+    fi
+  fi
+else
+  rm -f "$STALL_FLAG"
+fi
 exit 0

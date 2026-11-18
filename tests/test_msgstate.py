@@ -48,6 +48,13 @@ def pending(base):
     return json.loads(r.stdout)
 
 
+def oldest_age(base):
+    r = run(["oldest-pending-age"], base)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout.strip()
+    return int(out) if out else None
+
+
 def mark(base, key, status, error=None):
     args = ["mark", key, status]
     if error is not None:
@@ -259,6 +266,36 @@ def main():
           "last_error" not in state(base7)["EvTest1"])
     check("reconcile-doneでレコード自体は残る",
           state(base7)["EvTest1"]["status"] == "done")
+
+    # 10. oldest-pending-age（watchdogの滞留警告用、agyレビュー 2026-11-18）
+    def aged_msg(event_id, seconds_ago, ts):
+        m = msg(event_id=event_id, ts=ts)
+        m["received_at"] = (datetime.now(timezone.utc)
+                            - timedelta(seconds=seconds_ago)).isoformat()
+        return m
+
+    base8 = make_base([])
+    check("未処理が無ければoldest-pending-ageは空",
+          oldest_age(base8) is None)
+    base9 = make_base([aged_msg("EvOld", 200, "1794478306.000001")])
+    age = oldest_age(base9)
+    check("最古の未処理からの経過秒を返す",
+          age is not None and 190 <= age <= 220, f"got {age}")
+    base10 = make_base([aged_msg("EvOld", 200, "1794478306.000001"),
+                        aged_msg("EvNew", 30, "1794478306.000002")])
+    age = oldest_age(base10)
+    check("複数あれば最古のものを測る",
+          age is not None and 190 <= age <= 220, f"got {age}")
+    base11 = make_base([aged_msg("EvProc", 200, "1794478306.000001")])
+    mark(base11, "EvProc", "processing")
+    check("処理中のものは滞留に数えない",
+          oldest_age(base11) is None)
+    base12 = make_base([aged_msg("EvStale", 200, "1794478306.000001")])
+    mark(base12, "EvStale", "processing")
+    set_stale(base12, "EvStale", 1)
+    age = oldest_age(base12)
+    check("staleな処理中はpendingへ戻してから測る",
+          age is not None and 190 <= age <= 220, f"got {age}")
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")

@@ -54,6 +54,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import inbox_state
 import seen_state
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -183,10 +184,31 @@ def main():
 
     seen_order = load_seen()
     seen_set = set(seen_order)
+    # Inbox .bak snapshot (Neiro's 2026-11-18 share, inbox_state.py):
+    # backfill time is the snapshot moment -- only when every line
+    # parses, so a corrupt body never overwrites a good backup.
+    # Forced refresh here (max_age_secs=0); the poll path throttles
+    # the same snapshot to once a day.
+    inbox_state.snapshot_inbox(INBOX, max_age_secs=0)
+    # Recovery mode: the inbox body was restored from its .bak, and
+    # the marker carries the .bak's newest ts. The seen file keeps
+    # advancing past the snapshot, so without rewinding the floor to
+    # the marker the gap between snapshot and corruption would be
+    # excluded from backfill forever (agy review point, 2026-11-18).
+    marker = inbox_state.read_recovery_marker(INBOX)
+    recovery_floor = None
+    present_keys = set()
+    if marker is not None:
+        recovery_floor = marker["bak_newest_ts"]
+        parsed = inbox_state._parse_lines(INBOX)
+        if parsed is not None:
+            present_keys = inbox_state.inbox_keys(parsed[0])
     # Floor: only messages newer than the floor can be "missed during
     # downtime". Anything older predates the watcher (or was already
     # handled by hand) and must not be re-added.
     floor = compute_floor(seen_order, floor_arg, window_minutes)
+    if recovery_floor is not None:
+        floor = min(floor, recovery_floor)
     recovered = 0
     checked = 0
     errors = []
@@ -212,7 +234,22 @@ def main():
             return
         key = f"ts:{channel}:{ts}"
         if key in seen_set:
-            return
+            # Recovery mode: the seen set already holds the gap
+            # messages (the listener admitted them before the inbox
+            # body was lost), so the plain seen check would skip
+            # exactly the messages the restore needs back. Re-admit
+            # only messages actually missing from the restored inbox
+            # and newer than the .bak snapshot; anything already in
+            # the inbox, or at/below the snapshot, stays skipped.
+            if recovery_floor is None:
+                return
+            try:
+                if float(ts) <= recovery_floor:
+                    return
+            except ValueError:
+                return
+            if (channel, ts) in present_keys:
+                return
         record = {
             "event_id": None,
             "received_at": datetime.now(timezone.utc).isoformat(),

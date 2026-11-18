@@ -21,6 +21,8 @@ thread before sending, so a re-run never double-posts).
 Usage:
   msgstate.py pending        # JSON list of pending/failed messages
   msgstate.py count-pending  # just the number
+  msgstate.py oldest-pending-age  # seconds since the oldest pending
+                                  # message arrived (empty when none)
   msgstate.py stats          # skipped-row counts for the inbox file
   msgstate.py mark KEY STATUS [--error TEXT]
   msgstate.py key-of         # read one inbox JSON line on stdin, print its key
@@ -44,6 +46,8 @@ import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+import inbox_state
 
 BASE = os.environ.get("SLACK_LISTENER_BASE") or os.path.dirname(os.path.abspath(__file__))
 EVENTS = os.path.join(BASE, "events")
@@ -132,6 +136,15 @@ def _write_inbox_stats(total, skipped_blank, skipped_malformed):
 
 
 def read_inbox():
+    # Inbox .bak (Neiro's 2026-11-18 share, inbox_state.py): a missing
+    # or wholly-unparseable body is restored from the backup before
+    # anything reads it, and the backup itself is refreshed (throttled
+    # to once a day from this poll path; backfill refreshes it on every
+    # run) whenever the body parses fully. Both are no-ops on a healthy
+    # file -- restore only acts on a missing/wholly-bad body, snapshot
+    # only when the .bak is stale.
+    inbox_state.restore_inbox(INBOX)
+    inbox_state.snapshot_inbox(INBOX)
     if not os.path.exists(INBOX):
         return []
     out = []
@@ -272,6 +285,46 @@ def cmd_count():
     print(n)
 
 
+def oldest_pending_age(items=None, now=None):
+    """Age in seconds of the oldest pending/failed item, or None.
+
+    The watchdog's stall warning (agy review 2026-11-18, thread
+    1795006461.907139) needs this: when the hook itself has stopped,
+    unprocessed messages pile up, and only a timer-driven check can
+    notice. The age is measured from received_at -- how long the
+    message has waited for processing. Items currently being
+    processed are excluded by pending_items(), so in-flight work
+    never trips the warning; a worker that died mid-processing is
+    reclaimed by the stale sweep (600s) before the age is read.
+    """
+    if items is None:
+        items = pending_items()
+    if not items:
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc)
+    oldest = None
+    for item in items:
+        received = _parse_ts(item.get("message", {}).get("received_at") or "")
+        if received is None:
+            continue
+        if received.tzinfo is None:
+            received = received.replace(tzinfo=timezone.utc)
+        if oldest is None or received < oldest:
+            oldest = received
+    if oldest is None:
+        return None
+    return max(0, int((now - oldest).total_seconds()))
+
+
+def cmd_oldest_pending_age():
+    with state_lock(exclusive=True):
+        state = load_state()
+        sweep_stale_locked(state)
+        age = oldest_pending_age(pending_items(state))
+    print(age if age is not None else "")
+
+
 def cmd_reconcile_done(argv):
     """Clear stale last_error from done entries.
 
@@ -374,6 +427,9 @@ def main():
         return 0
     if cmd == "count-pending":
         cmd_count()
+        return 0
+    if cmd == "oldest-pending-age":
+        cmd_oldest_pending_age()
         return 0
     if cmd == "stats":
         cmd_stats()
