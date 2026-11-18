@@ -36,7 +36,11 @@ Shape:
     by hand re-enables auto-join. Adopted 2026-11-18 from Yama's
     auto-join share (slack-yama 32c07f2a): without this, the 1-minute
     timer would rejoin a channel within a minute of being removed
-    from it.
+    from it. The state file is backed up on every save
+    (auto_join_state.json.bak holds the previous good state, and a
+    missing or corrupt main file falls back to it), so losing the
+    file does not wipe the removed record. Added 2026-11-18 after
+    Yama noted all three watchers share the no-backup weakness.
   * Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py,
     neiro-slack-system): a channel the bot is already a member of but
     which has no inbox baseline yet -- joined by hand, or a join
@@ -88,18 +92,29 @@ def subprocess_env():
     return env
 
 
-def load_state(path=STATE_PATH):
-    """Membership memory: {"member": [...], "removed": [...]}.
-
-    Missing or corrupt state means "no memory yet", never a crash:
-    the first run after this lands simply starts recording.
-    """
+def _read_state_file(path):
+    """Parsed state dict from one file, or None when unreadable."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return {"member": [], "removed": []}
-    if not isinstance(data, dict):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_state(path=STATE_PATH):
+    """Membership memory: {"member": [...], "removed": [...]}.
+
+    Missing or corrupt state means "no memory yet", never a crash:
+    the first run after this lands simply starts recording. When the
+    main file is missing or corrupt, the backup copy
+    (auto_join_state.json.bak) kept by save_state is tried, so a lost
+    state file does not wipe the removed-channel memory.
+    """
+    data = _read_state_file(path)
+    if data is None:
+        data = _read_state_file(path + ".bak")
+    if data is None:
         return {"member": [], "removed": []}
     member = data.get("member") or []
     removed = data.get("removed") or []
@@ -109,6 +124,14 @@ def load_state(path=STATE_PATH):
 
 def save_state(state, path=STATE_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Keep the previous good state as a backup before replacing it.
+    # Only a file that parses as a state dict is backed up: a corrupt
+    # main file must never overwrite a good backup.
+    if _read_state_file(path) is not None:
+        with open(path, encoding="utf-8") as f:
+            previous = f.read()
+        with open(path + ".bak", "w", encoding="utf-8") as f:
+            f.write(previous)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)

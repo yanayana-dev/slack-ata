@@ -152,6 +152,41 @@ with tempfile.TemporaryDirectory() as d:
     check("load_state on corrupt state is empty, not a crash",
           aj.load_state(p) == {"member": [], "removed": []})
 
+# State backup (2026-11-18): save_state keeps the previous good state
+# as .bak, and load_state falls back to it when the main file is lost
+# or corrupt, so the removed-channel memory survives a lost state
+# file. A corrupt main file must never overwrite a good backup.
+with tempfile.TemporaryDirectory() as d:
+    p = os.path.join(d, "state.json")
+    first = {"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE107"]}
+    second = {"member": ["C0EXAMPLE102"],
+              "removed": ["C0EXAMPLE107", "C0EXAMPLE110"]}
+    aj.save_state(first, p)
+    check("first save creates no backup yet",
+          not os.path.exists(p + ".bak"))
+    aj.save_state(second, p)
+    check("second save backs up the previous state",
+          aj.load_state(p + ".bak") == first)
+    os.remove(p)
+    check("load_state falls back to the backup when the main file is gone",
+          aj.load_state(p) == first)
+    aj.save_state(second, p)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{not json")
+    check("load_state falls back to the backup when the main file is corrupt",
+          aj.load_state(p) == first)
+    with open(p + ".bak", "w", encoding="utf-8") as f:
+        f.write("{not json")
+    check("load_state is empty when both main and backup are corrupt",
+          aj.load_state(p) == {"member": [], "removed": []})
+    aj.save_state(first, p)
+    aj.save_state(second, p)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{not json")
+    aj.save_state({"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE110"]}, p)
+    check("saving over a corrupt main file keeps the good backup",
+          aj.load_state(p + ".bak") == first)
+
 # Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py):
 # a member channel with no inbox baseline gets the gap backfill;
 # one with a baseline, a non-member, or an archived/private/DM
