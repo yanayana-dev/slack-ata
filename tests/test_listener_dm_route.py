@@ -37,8 +37,8 @@ CHECKS = [0, 0]  # [passed, failed]
 ATA = listener.ATA_USER_ID       # U0EXAMPLEOWNER, the authorizing user
 OTHER = "U0EXAMPLEUSER2"            # Yama
 BOT = "U0EXAMPLEBOT"              # Yanayana bot user
-CONV = "D0AAAAAAAA1"             # an im conversation with OTHER
-GROUP_CONV = "D0CCCCCCCC3"       # an mpim conversation
+CONV = "D0EXAMPLE001"             # an im conversation with OTHER
+GROUP_CONV = "D0EXAMPLE003"       # an mpim conversation
 
 
 def check(name, cond, detail=""):

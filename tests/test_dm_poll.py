@@ -30,9 +30,9 @@ CHECKS = [0, 0]  # [passed, failed]
 ATA = "U0EXAMPLEOWNER"        # あた (own messages are skipped)
 OTHER = "U0EXAMPLEUSER2"      # Yama
 THIRD = "U0EXAMPLEUSER"      # Neiro
-CONV_A = "D0AAAAAAAA1"     # im with OTHER
-CONV_B = "D0BBBBBBBB2"     # im, empty
-CONV_C = "D0CCCCCCCC3"     # mpim
+CONV_A = "D0EXAMPLE001"     # im with OTHER
+CONV_B = "D0EXAMPLE002"     # im, empty
+CONV_C = "D0EXAMPLE003"     # mpim
 
 STUB = r'''
 import json, os, sys

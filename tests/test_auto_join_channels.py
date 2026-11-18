@@ -44,8 +44,8 @@ PRIVATE = {"id": "C0EXAMPLE103", "name": "priv", "is_private": True,
            "is_archived": False, "is_member": False}
 ARCHIVED = {"id": "C0EXAMPLE104", "name": "arch", "is_private": False,
             "is_archived": True, "is_member": False}
-DM = {"id": "D0DM0000001", "is_member": False}
-MPIM = {"id": "G0GROUP0001", "is_private": True, "is_member": False}
+DM = {"id": "D0EXAMPLE004", "is_member": False}
+MPIM = {"id": "G0EXAMPLE005", "is_private": True, "is_member": False}
 
 check("new public channel is joinable", ids([NEW_PUBLIC]) == ["C0EXAMPLE101"])
 check("already-member channel is skipped", ids([JOINED]) == [])
