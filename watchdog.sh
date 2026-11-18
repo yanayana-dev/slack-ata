@@ -38,6 +38,14 @@ BACKOFF_BASE=30
 # warns to Slack on new/changed failures. Never blocks the watchdog.
 "$BASE/check_hooks.sh" >/dev/null 2>&1 || true
 
+# Listener sync check (adopted 2026-11-18 from Neiro's share e79a783,
+# Yanayana version: the public copy is scrubbed, so the live files are
+# run through scrub.sed before comparing). Compares live listener
+# files with the public copy and warns to Slack on drift, missing
+# files, syntax errors, or unsynced live files (dedup inside the
+# script). Never blocks the watchdog.
+"$BASE/slack-listener-sync-check.sh" >/dev/null 2>&1 || true
+
 # Auto-join of new public channels moved out of this watchdog on
 # 2026-11-18 (あた's choice: keep the heavy checks at 5 minutes, run
 # only the light auto-join every minute): it now runs on its own
