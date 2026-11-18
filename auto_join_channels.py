@@ -102,32 +102,76 @@ def _read_state_file(path):
     return data if isinstance(data, dict) else None
 
 
-def load_state(path=STATE_PATH):
-    """Membership memory: {"member": [...], "removed": [...]}.
+class StateError(Exception):
+    """State file(s) exist but none parses as a good state."""
 
-    Missing or corrupt state means "no memory yet", never a crash:
-    the first run after this lands simply starts recording. When the
-    main file is missing or corrupt, the backup copy
-    (auto_join_state.json.bak) kept by save_state is tried, so a lost
-    state file does not wipe the removed-channel memory.
+
+def _is_good_state(data):
+    """A state dict worth trusting: both keys present, both lists of ids.
+
+    This is the backup guard: a main file that parsed as JSON but lost
+    a key (e.g. an empty {} after a truncated write that still parses)
+    must never overwrite a good .bak. Counts are deliberately not
+    checked here: removed legitimately shrinks to zero when channels
+    are re-joined by hand (update_removed drops them), so a count
+    floor would false-positive.
     """
-    data = _read_state_file(path)
-    if data is None:
-        data = _read_state_file(path + ".bak")
-    if data is None:
-        return {"member": [], "removed": []}
+    if not isinstance(data, dict):
+        return False
+    member = data.get("member")
+    removed = data.get("removed")
+    if not isinstance(member, list) or not isinstance(removed, list):
+        return False
+    return all(isinstance(c, str) for c in member + removed)
+
+
+def _normalize(data):
     member = data.get("member") or []
     removed = data.get("removed") or []
     return {"member": sorted({str(c) for c in member}),
             "removed": sorted({str(c) for c in removed})}
 
 
+def load_state(path=STATE_PATH):
+    """Membership memory: {"member": [...], "removed": [...]}.
+
+    Missing state files mean "no memory yet", never a crash: the
+    first run after this lands simply starts recording. When the
+    main file is missing or corrupt, the backup copy
+    (auto_join_state.json.bak) kept by save_state is tried, and a
+    state recovered from the backup is written back to the main
+    file at once, so the next run does not depend on the .bak again.
+    When at least one file exists but neither parses as a good
+    state, StateError is raised instead of starting empty: an
+    empty start would re-join removed channels, which is exactly
+    what the backup exists to prevent.
+    """
+    data = _read_state_file(path)
+    if data is not None:
+        return _normalize(data)
+    data = _read_state_file(path + ".bak")
+    if data is not None:
+        state = _normalize(data)
+        try:
+            save_state(state, path)
+        except Exception:
+            pass  # recovery already succeeded; a failed write-back
+            # must not turn this run into a failure
+        return state
+    if not os.path.exists(path) and not os.path.exists(path + ".bak"):
+        return {"member": [], "removed": []}
+    raise StateError(
+        f"state unreadable: {path} and {path}.bak both unusable; "
+        "refusing to start empty (that would re-join removed channels)")
+
+
 def save_state(state, path=STATE_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # Keep the previous good state as a backup before replacing it.
-    # Only a file that parses as a state dict is backed up: a corrupt
-    # main file must never overwrite a good backup.
-    if _read_state_file(path) is not None:
+    # Only a file that parses as a good state is backed up: a corrupt
+    # main file, or one that lost a key, must never overwrite a good
+    # backup.
+    if _is_good_state(_read_state_file(path)):
         with open(path, encoding="utf-8") as f:
             previous = f.read()
         with open(path + ".bak", "w", encoding="utf-8") as f:
@@ -329,7 +373,15 @@ def main(argv=None):
     except Exception as e:
         print(f"auto_join: {e}", file=sys.stderr)
         return 2
-    state = load_state()
+    try:
+        state = load_state()
+    except StateError as e:
+        # Both state files unusable: stop without joining or saving,
+        # and record the failure instead of starting empty.
+        print(f"auto_join: {e}", file=sys.stderr)
+        record({"at": datetime.now(timezone.utc).isoformat(),
+                "error": str(e)})
+        return 2
     new_state = update_removed(conversations, state)
     newly_removed = (set(new_state["removed"])
                      - set(state.get("removed") or []))

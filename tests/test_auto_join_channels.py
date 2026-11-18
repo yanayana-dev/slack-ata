@@ -139,6 +139,16 @@ check("update_removed ignores an archived former channel",
                          "removed": []})["removed"] == [])
 
 import tempfile
+
+
+def raises_state_error(fn):
+    try:
+        fn()
+    except aj.StateError:
+        return True
+    return False
+
+
 with tempfile.TemporaryDirectory() as d:
     p = os.path.join(d, "state.json")
     check("load_state on a missing file is empty",
@@ -149,13 +159,16 @@ with tempfile.TemporaryDirectory() as d:
                                "removed": ["C0EXAMPLE107"]})
     with open(p, "w", encoding="utf-8") as f:
         f.write("{not json")
-    check("load_state on corrupt state is empty, not a crash",
-          aj.load_state(p) == {"member": [], "removed": []})
+    check("load_state on a corrupt state with no backup raises, "
+          "never starts empty",
+          raises_state_error(lambda: aj.load_state(p)))
 
-# State backup (2026-11-18): save_state keeps the previous good state
-# as .bak, and load_state falls back to it when the main file is lost
-# or corrupt, so the removed-channel memory survives a lost state
-# file. A corrupt main file must never overwrite a good backup.
+# State backup (2026-11-18, hardened from Yama's .bak proposal):
+# save_state keeps the previous good state as .bak, and load_state
+# falls back to it when the main file is lost or corrupt, writing the
+# recovered state back to the main file at once. A main file that
+# parses but lost a key must never overwrite a good backup, and when
+# both files are unusable load_state raises instead of starting empty.
 with tempfile.TemporaryDirectory() as d:
     p = os.path.join(d, "state.json")
     first = {"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE107"]}
@@ -170,21 +183,35 @@ with tempfile.TemporaryDirectory() as d:
     os.remove(p)
     check("load_state falls back to the backup when the main file is gone",
           aj.load_state(p) == first)
+    check("fallback from the backup writes the state back to the main file",
+          os.path.exists(p) and aj.load_state(p) == first)
     aj.save_state(second, p)
     with open(p, "w", encoding="utf-8") as f:
         f.write("{not json")
     check("load_state falls back to the backup when the main file is corrupt",
           aj.load_state(p) == first)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{not json")
     with open(p + ".bak", "w", encoding="utf-8") as f:
         f.write("{not json")
-    check("load_state is empty when both main and backup are corrupt",
-          aj.load_state(p) == {"member": [], "removed": []})
+    check("load_state raises when both main and backup are corrupt",
+          raises_state_error(lambda: aj.load_state(p)))
     aj.save_state(first, p)
     aj.save_state(second, p)
     with open(p, "w", encoding="utf-8") as f:
         f.write("{not json")
     aj.save_state({"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE110"]}, p)
     check("saving over a corrupt main file keeps the good backup",
+          aj.load_state(p + ".bak") == first)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("{}")
+    aj.save_state({"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE110"]}, p)
+    check("saving over an empty-dict main file keeps the good backup",
+          aj.load_state(p + ".bak") == first)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"member": ["C0EXAMPLE102"]}')
+    aj.save_state({"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE110"]}, p)
+    check("saving over a key-missing main file keeps the good backup",
           aj.load_state(p + ".bak") == first)
 
 # Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py):
