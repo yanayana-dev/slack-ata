@@ -27,10 +27,13 @@
 # 残る隙間は「チェック自体が壊れて走らない場合」で、それは watchdog の
 # ログと systemd の失敗状態でしか見えない（3者共通の課題として持ち帰り）。
 #
-# 実行場所: watchdog.sh から5分間隔で呼ぶ。check_hooks.sh と同じ形で、
-# 異常時は Slack へ警告する（重複抑止は署名付き状態ファイル）。正常時は
-# 状態ファイルを消して "listener sync: ok" を出して exit 0。
-# watchdog は root で動くため、既定パスは $HOME ではなく絶対パスで書く。
+# 実行場所: 当初は watchdog.sh から5分間隔で呼んでいたが、2026-11-18
+# 夜に専用 systemd タイマー（slack-sync-check.timer、5分間隔）へ移行した
+# （スレッドで宣言した方針。watchdog 自身が呼び出し元だと、watchdog の
+# ずれを watchdog が見る自己参照が残るため）。異常時は Slack へ警告する
+# （重複抑止は署名付き状態ファイル）。正常時は状態ファイルを消して
+# "listener sync: ok" を出して exit 0。
+# systemd は root で動くため、既定パスは $HOME ではなく絶対パスで書く。
 #
 # 環境変数（テスト用）: LIVE_DIR, PUBLIC_DIR, SCRUB_SED, SYNC_CHECK_STATE,
 # SYNC_CHECK_CHANNEL, SLACKCLI, --dry-run。

@@ -1,0 +1,13 @@
+[Unit]
+Description=Check live Slack listener matches the public copy (slack-listener-sync-check.sh)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/path/to/slack-watcher/proxy.env
+Environment=HOME=/path/to
+# slackcli is a Bun binary: without NODE_USE_ENV_PROXY it ignores the
+# proxy variables and hangs on TLS (see slack-auto-join.service).
+Environment=NODE_USE_ENV_PROXY=1
+WorkingDirectory=/path/to/slack-watcher
+ExecStart=/usr/bin/env bash /path/to/slack-watcher/slack-listener-sync-check.sh
+TimeoutStartSec=300

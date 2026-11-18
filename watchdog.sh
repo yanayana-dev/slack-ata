@@ -38,13 +38,13 @@ BACKOFF_BASE=30
 # warns to Slack on new/changed failures. Never blocks the watchdog.
 "$BASE/check_hooks.sh" >/dev/null 2>&1 || true
 
-# Listener sync check (adopted 2026-11-18 from Neiro's share e79a783,
-# Yanayana version: the public copy is scrubbed, so the live files are
-# run through scrub.sed before comparing). Compares live listener
-# files with the public copy and warns to Slack on drift, missing
-# files, syntax errors, or unsynced live files (dedup inside the
-# script). Never blocks the watchdog.
-"$BASE/slack-listener-sync-check.sh" >/dev/null 2>&1 || true
+# Listener sync check moved out of this watchdog on 2026-11-18
+# night: it compares live listener files with the (scrubbed) public
+# copy, and the watchdog itself is one of the compared files, so the
+# watchdog calling it left a self-reference (the drifted file would
+# be running its own check). It now runs on its own
+# slack-sync-check.timer (5 min); this watchdog only restores and
+# starts those units below, like the auto-join units.
 
 # Auto-join of new public channels moved out of this watchdog on
 # 2026-11-18 (あた's choice: keep the heavy checks at 5 minutes, run
@@ -187,6 +187,20 @@ for u in slack-auto-join.service slack-auto-join.timer; do
   fi
 done
 
+# Also restore the sync-check units (added 2026-11-18 night with the
+# move out of this watchdog): without the 5-minute timer, drift
+# between the live listener and the public copy goes unnoticed.
+sync_check_reinstalled=0
+for u in slack-sync-check.service slack-sync-check.timer; do
+  if ! cmp -s "$BASE/$u" "$DST_DIR/$u"; then
+    if reinstall_unit "$BASE/$u" "$DST_DIR/$u" "$u" slack-sync-check.timer; then
+      sync_check_reinstalled=1
+    fi
+  else
+    state_reset "$u"
+  fi
+done
+
 # The timer itself can sit inactive even when every unit file is intact:
 # after a VM replacement timers.target never becomes active (all system
 # timers were dead on 2026-11-13), so `enable` alone does not start it,
@@ -221,6 +235,10 @@ if ! systemctl is-active --quiet slack-auto-join.timer; then
   systemctl start slack-auto-join.timer >/dev/null 2>&1
 fi
 
+if ! systemctl is-active --quiet slack-sync-check.timer; then
+  systemctl start slack-sync-check.timer >/dev/null 2>&1
+fi
+
 # A reinstalled unit only takes effect after a restart (daemon-reload
 # alone does not affect the running service), so restart right away and
 # let the next run verify health instead of restarting twice.
@@ -239,6 +257,9 @@ if [ "$dm_poll_reinstalled" = 1 ]; then
 fi
 if [ "$auto_join_reinstalled" = 1 ]; then
   systemctl restart slack-auto-join.timer >/dev/null 2>&1
+fi
+if [ "$sync_check_reinstalled" = 1 ]; then
+  systemctl restart slack-sync-check.timer >/dev/null 2>&1
 fi
 
 if ! systemctl is-active --quiet "$UNIT"; then
