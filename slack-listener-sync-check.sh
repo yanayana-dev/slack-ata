@@ -24,8 +24,10 @@
 # このスクリプト自身も公開用コピーにあるので照合対象に入る。Yamaさんの
 # 「watchdog.sh 自体は誰が照合するのか」という問いへの答えもこれ:
 # watchdog.sh は公開用コピーにあるので、このチェックが照合する。
-# 残る隙間は「チェック自体が壊れて走らない場合」で、それは watchdog の
-# ログと systemd の失敗状態でしか見えない（3者共通の課題として持ち帰り）。
+# 残る隙間は「チェック自体が壊れて走らない場合」だったが、2026-11-19
+# に runner（slack-sync-check-runner.sh）が drift 警告後も exit 0 に
+# 正規化し、watchdog.sh が is-failed で硬い失敗だけを Slack へ警告する
+# 形にしたので、ユニットの failed 状態がその隙間を埋める。
 #
 # 実行場所: 当初は watchdog.sh から5分間隔で呼んでいたが、2026-11-18
 # 夜に専用 systemd タイマー（slack-sync-check.timer、5分間隔）へ移行した
@@ -139,7 +141,7 @@ if [ "$sig" = "$prev" ]; then
   exit 1
 fi
 
-msg="【リスナー同期チェック】稼働中の ~/workspace/slack-listener と公開用コピーの内容がずれています（watchdogから5分間隔で確認中）:
+msg="【リスナー同期チェック】稼働中の ~/workspace/slack-listener と公開用コピーの内容がずれています（専用タイマー slack-sync-check.timer で5分間隔で確認中）:
 $text
 稼働中の変更を公開用へ戻すか、公開用の変更を稼働中へ反映してください。"
 if [ "$DRY_RUN" = "1" ]; then

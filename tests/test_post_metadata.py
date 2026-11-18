@@ -306,6 +306,178 @@ def test_read_thread_paging():
         check("read_thread raises on ok:false", True)
 
 
+class FakeCurl:
+    """Scripted _curl_get_json: outcomes are ("ok", dict) /
+    ("status", code, dict) / ("error", msg) / ("missing",).
+    Records every call (url, bearer auth present)."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+        self.sleeps = []
+
+    def __call__(self, url, token, headers):
+        self.calls.append({
+            "url": url,
+            "auth": headers.get("Authorization"),
+        })
+        kind = self.outcomes.pop(0) if self.outcomes else ("ok", {"ok": True})
+        if kind[0] == "ok":
+            return 200, json.dumps(kind[1]).encode("utf-8")
+        if kind[0] == "status":
+            return kind[1], json.dumps(kind[2]).encode("utf-8")
+        if kind[0] == "error":
+            raise post_metadata._CurlError(kind[1])
+        if kind[0] == "missing":
+            raise FileNotFoundError("no curl")
+        raise AssertionError("unknown outcome %r" % (kind,))
+
+    def sleep(self, secs):
+        self.sleeps.append(secs)
+
+
+def test_get_uses_curl():
+    # GET with no injected urlopen takes the curl path: urllib is
+    # never touched (patched to fail loudly) and the read succeeds.
+    import urllib.request
+    page = {"ok": True, "messages": [
+        _meta_msg("1000.000000", text="parent"),
+        _meta_msg("1001.000000", event_id=EVENT_ID, text="our reply"),
+    ], "has_more": False, "response_metadata": {}}
+    fake = FakeCurl([("ok", page)])
+    real_curl = post_metadata._curl_get_json
+    real_urlopen = urllib.request.urlopen
+
+    def _no_urllib(req, timeout=None):
+        raise AssertionError("urllib must not be used for a curl GET")
+
+    post_metadata._curl_get_json = fake
+    urllib.request.urlopen = _no_urllib
+    try:
+        msgs = post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                         sleep=fake.sleep)
+        check("GET read goes through curl, not urllib",
+              len(msgs) == 2 and msgs[1]["ts"] == "1001.000000"
+              and len(fake.calls) == 1
+              and "conversations.replies" in fake.calls[0]["url"]
+              and fake.calls[0]["auth"] == "Bearer " + FAKE_TOKEN)
+    finally:
+        post_metadata._curl_get_json = real_curl
+        urllib.request.urlopen = real_urlopen
+
+
+def test_get_curl_retries():
+    # Curl transport error, then a 500, then success: same ladder
+    # (1s, 2s) as the urllib path, and the read still succeeds.
+    page = {"ok": True, "messages": [_meta_msg("1000.000000", text="parent")],
+            "has_more": False, "response_metadata": {}}
+    fake = FakeCurl([("error", "curl rc=7: connect failed"),
+                     ("status", 500, {"ok": False}),
+                     ("ok", page)])
+    real_curl = post_metadata._curl_get_json
+    post_metadata._curl_get_json = fake
+    try:
+        msgs = post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                         sleep=fake.sleep)
+        check("curl GET retries transport errors and 5xx",
+              len(msgs) == 1 and len(fake.calls) == 3
+              and fake.sleeps == [1, 2],
+              f"calls={len(fake.calls)} sleeps={fake.sleeps}")
+    finally:
+        post_metadata._curl_get_json = real_curl
+
+
+def test_get_curl_falls_back_without_binary():
+    # No curl binary and no injected urlopen: the urllib path is
+    # used unchanged (urllib itself is stubbed here, not bypassed).
+    import urllib.request
+    page = {"ok": True, "messages": [_meta_msg("1000.000000", text="parent")],
+            "has_more": False, "response_metadata": {}}
+    fake = FakeUrlopen([("ok", page)])
+    real_binary = post_metadata._curl_binary
+    real_urlopen = urllib.request.urlopen
+    post_metadata._curl_binary = lambda: None
+    urllib.request.urlopen = fake
+    try:
+        msgs = post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                         sleep=fake.sleep)
+        check("GET falls back to urllib when curl is absent",
+              len(msgs) == 1 and len(fake.calls) == 1)
+    finally:
+        post_metadata._curl_binary = real_binary
+        urllib.request.urlopen = real_urlopen
+
+
+def test_get_curl_vanishing_falls_back():
+    # curl present at the check but gone at exec: FileNotFoundError
+    # falls back to urllib within the same attempt.
+    import urllib.request
+    page = {"ok": True, "messages": [_meta_msg("1000.000000", text="parent")],
+            "has_more": False, "response_metadata": {}}
+    fake = FakeUrlopen([("ok", page)])
+    real_curl = post_metadata._curl_get_json
+    real_urlopen = urllib.request.urlopen
+    post_metadata._curl_get_json = FakeCurl([("missing",)])
+    urllib.request.urlopen = fake
+    try:
+        msgs = post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                         sleep=fake.sleep)
+        check("GET falls back to urllib when curl vanishes",
+              len(msgs) == 1 and len(fake.calls) == 1)
+    finally:
+        post_metadata._curl_get_json = real_curl
+        urllib.request.urlopen = real_urlopen
+
+
+def test_get_curl_http_errors():
+    # A non-retryable status is raised at once; ok:false is a
+    # verdict, never retried -- same as the urllib path.
+    real_curl = post_metadata._curl_get_json
+    try:
+        post_metadata._curl_get_json = FakeCurl(
+            [("status", 403, {"ok": False, "error": "invalid_auth"})])
+        try:
+            post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                      sleep=lambda s: None)
+            check("curl GET raises http_403 at once", False, "no exception")
+        except RuntimeError as e:
+            check("curl GET raises http_403 at once", str(e) == "http_403",
+                  f"error={e}")
+        post_metadata._curl_get_json = FakeCurl(
+            [("ok", {"ok": False, "error": "channel_not_found"})])
+        try:
+            post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                      sleep=lambda s: None)
+            check("curl GET raises on ok:false", False, "no exception")
+        except RuntimeError as e:
+            check("curl GET raises on ok:false",
+                  str(e) == "slack: channel_not_found", f"error={e}")
+    finally:
+        post_metadata._curl_get_json = real_curl
+
+
+def test_post_stays_on_urllib():
+    # POST never touches curl: a curl that fails loudly still
+    # leaves the send working through the injected urlopen.
+    real_curl = post_metadata._curl_get_json
+
+    def _loud_curl(*a):
+        raise AssertionError("curl must not be used for a POST")
+
+    post_metadata._curl_get_json = _loud_curl
+    try:
+        fake = FakeUrlopen([("ok", {"ok": True, "ts": "1001.000000"})])
+        ok, result = post_metadata.post(
+            post_metadata.build_payload(CHANNEL, "hi", THREAD_TS,
+                                        event_id=EVENT_ID),
+            FAKE_TOKEN, urlopen=fake, sleep=fake.sleep)
+        check("POST stays on urllib, never calls curl",
+              ok and result.get("ts") == "1001.000000"
+              and fake.calls[0]["method"] == "POST")
+    finally:
+        post_metadata._curl_get_json = real_curl
+
+
 def test_find_reply():
     page = {"ok": True, "messages": [
         _meta_msg("1000.000000", text="parent"),
@@ -495,6 +667,12 @@ def main():
     test_post_no_retry()
     test_find_by_metadata()
     test_read_thread_paging()
+    test_get_uses_curl()
+    test_get_curl_retries()
+    test_get_curl_falls_back_without_binary()
+    test_get_curl_vanishing_falls_back()
+    test_get_curl_http_errors()
+    test_post_stays_on_urllib()
     test_find_reply()
     test_resolve_token()
     test_cli()

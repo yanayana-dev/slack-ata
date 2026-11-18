@@ -30,12 +30,31 @@ lost (that is exactly how Neiro's identical reply was posted
 three times). Arrival is then checked by the caller via the
 thread history / metadata stamp (reply_once.py, reconcile_ambiguous.py).
 GET reads are idempotent, so they still retry 429, 5xx and network
-errors, up to 3 attempts with backoff 1s, 2s (429 honors
-Retry-After). Never retry when the API returns ok:false -- a
-rejected call is a verdict, not a transient failure. This is
-deliberately stricter than Neiro's reference, which also retries a
-200 response carrying error "ratelimited"; the agreement is that
-ok:false is never retried.
+errors, up to 5 attempts with backoff 1s, 2s, 4s, 8s (429 honors
+Retry-After). The ladder was extended from 3 attempts (1s, 2s) on
+2026-11-19 from Yama's share in thread 1795019972.339449: reads are
+cut mid-stream (IncompleteRead / Remote end closed) even when tiny,
+so a longer ladder fits the observed failure better. POST stays
+429-only, and ok:false is still never retried -- a rejected call
+is a verdict, not a transient failure. This is deliberately
+stricter than Neiro's reference, which also retries a 200 response
+carrying error "ratelimited"; the agreement is that ok:false is
+never retried, and those parts of the 2026-11-15 agreement are
+unchanged.
+
+Transport (revised 2026-11-19 from Neiro's share in the same
+thread, <https://github.com/neiro-taskboard/neiro-slack-system/commit/7ccf49e>):
+GET reads go through curl when the binary is available, falling
+back to urllib when it is not. Same URL, same token: urllib
+repeats IncompleteRead / Remote end closed against the egress
+proxy while curl succeeded 5/5 on Neiro's side, and 3/3 in a
+direct check from this VM -- the failure is the transport, not
+the size or the endpoint. POST stays on urllib: only the read
+side is proven better on curl, and the POST path's 429-only
+policy (a lost response may mean the post landed) is untouched.
+A curl 429 retries with the default ladder (Retry-After is not
+surfaced through the curl call). The token is passed to curl as
+a header argument and is never logged.
 
 The bot token is read from slackcli's auth store
 (~/.config/slackcli/workspaces.json, profile "yanayana" / workspace
@@ -70,6 +89,8 @@ Test hooks (env vars, used by tests/test_post_metadata.py):
 """
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -81,8 +102,8 @@ DEFAULT_STORE = os.path.expanduser("~/.config/slackcli/workspaces.json")
 DEFAULT_CONFIG = os.path.join(BASE, "config.json")
 
 EVENT_TYPE = "yanayana_reply"
-MAX_ATTEMPTS = 3
-BACKOFF_SECS = (1, 2)
+MAX_ATTEMPTS = 5
+BACKOFF_SECS = (1, 2, 4, 8)
 API_BASE = os.environ.get("SLACK_API_BASE", "https://slack.com/api")
 
 
@@ -188,7 +209,7 @@ def _is_retryable_http(code, method):
 
 
 def _wait_for_retry(attempt, retry_after):
-    """Backoff before the next attempt (1s, 2s); 429 honors Retry-After."""
+    """Backoff before the next attempt (1s, 2s, 4s, 8s); 429 honors Retry-After."""
     wait = BACKOFF_SECS[attempt - 1] if attempt <= len(BACKOFF_SECS) else BACKOFF_SECS[-1]
     if retry_after is not None:
         try:
@@ -196,6 +217,45 @@ def _wait_for_retry(attempt, retry_after):
         except (TypeError, ValueError):
             pass
     return max(0.0, wait)
+
+
+class _CurlError(OSError):
+    """curl transport failure (connect cut, timeout, no status)."""
+
+
+def _curl_binary():
+    # Separate helper so tests can pretend curl is absent.
+    return shutil.which("curl")
+
+
+def _curl_get_json(url, token, headers):
+    """One GET via curl. Returns (http_status, raw_body_bytes).
+
+    -sS silences progress but keeps errors; --max-time 30 matches
+    the urllib timeout; -w appends the status on its own last
+    line so the body and the status stay separable. Raises
+    _CurlError on a non-zero exit, a timeout, or an unparsable
+    status line; FileNotFoundError propagates when the binary
+    vanished, so the caller can fall back to urllib.
+    """
+    args = ["curl", "-sS", "--max-time", "30",
+            "-H", "Authorization: Bearer " + token,
+            "-H", "User-Agent: " + headers.get("User-Agent", ""),
+            "-w", "\n__status__:%{http_code}", url]
+    try:
+        proc = subprocess.run(args, capture_output=True, timeout=35)
+    except subprocess.TimeoutExpired as e:
+        raise _CurlError("curl timeout: %s" % e)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise _CurlError("curl rc=%d: %s" % (proc.returncode, err[:200]))
+    body, sep, status = proc.stdout.rpartition(b"\n__status__:")
+    if not sep:
+        raise _CurlError("curl: no status line in output")
+    try:
+        return int(status.decode("ascii").strip()), body
+    except ValueError:
+        raise _CurlError("curl: bad status %r" % status[:20])
 
 
 def _request_json(url, token, data=None, method="GET",
@@ -210,7 +270,14 @@ def _request_json(url, token, data=None, method="GET",
     once, because the post may already have landed and only the
     response was lost; the caller then checks arrival via the
     thread history / metadata stamp instead of blind-resending.
+    GET reads use curl when no urlopen was injected and the binary
+    is present (urllib repeats IncompleteRead / Remote end closed
+    against the egress proxy; curl does not -- see the module
+    docstring). A curl 429 retries on the default ladder because
+    Retry-After is not surfaced through the curl call; when curl
+    is absent the urllib path is used unchanged.
     """
+    injected_urlopen = urlopen is not None
     if urlopen is None:
         urlopen = urllib.request.urlopen
     if sleep is None:
@@ -223,32 +290,58 @@ def _request_json(url, token, data=None, method="GET",
     if data is not None:
         body = json.dumps(data).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
+    use_curl = (method == "GET" and not injected_urlopen
+                and _curl_binary() is not None)
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        req = urllib.request.Request(url, data=body, headers=headers,
-                                     method=method)
-        try:
-            with urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                retry_after = None
-                try:
-                    retry_after = resp.headers.get("Retry-After")
-                except AttributeError:
-                    pass
-        except urllib.error.HTTPError as e:
-            if _is_retryable_http(e.code, method) and attempt < MAX_ATTEMPTS:
-                sleep(_wait_for_retry(attempt, _header_retry_after(e)))
-                continue
-            raise RuntimeError("http_%d" % e.code)
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_error = e
-            # GET reads are idempotent, so a lost read response is
-            # safe to retry. A POST is not: the post may already
-            # have landed (Neiro's 2026-11-15 triple post).
-            if method == "GET" and attempt < MAX_ATTEMPTS:
-                sleep(_wait_for_retry(attempt, None))
-                continue
-            raise RuntimeError("network: %s" % e)
+        raw = None
+        if use_curl:
+            try:
+                status, raw = _curl_get_json(url, token, headers)
+            except FileNotFoundError:
+                # curl vanished mid-run: fall back to urllib below
+                # for this attempt and the rest.
+                use_curl = False
+            except _CurlError as e:
+                last_error = e
+                if attempt < MAX_ATTEMPTS:
+                    sleep(_wait_for_retry(attempt, None))
+                    continue
+                raise RuntimeError("network: %s" % e)
+            if use_curl:
+                if status == 200:
+                    pass  # raw is set; parse below.
+                elif _is_retryable_http(status, method) \
+                        and attempt < MAX_ATTEMPTS:
+                    sleep(_wait_for_retry(attempt, None))
+                    continue
+                else:
+                    raise RuntimeError("http_%d" % status)
+        if not use_curl:
+            req = urllib.request.Request(url, data=body, headers=headers,
+                                         method=method)
+            try:
+                with urlopen(req, timeout=30) as resp:
+                    raw = resp.read()
+                    retry_after = None
+                    try:
+                        retry_after = resp.headers.get("Retry-After")
+                    except AttributeError:
+                        pass
+            except urllib.error.HTTPError as e:
+                if _is_retryable_http(e.code, method) and attempt < MAX_ATTEMPTS:
+                    sleep(_wait_for_retry(attempt, _header_retry_after(e)))
+                    continue
+                raise RuntimeError("http_%d" % e.code)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_error = e
+                # GET reads are idempotent, so a lost read response is
+                # safe to retry. A POST is not: the post may already
+                # have landed (Neiro's 2026-11-15 triple post).
+                if method == "GET" and attempt < MAX_ATTEMPTS:
+                    sleep(_wait_for_retry(attempt, None))
+                    continue
+                raise RuntimeError("network: %s" % e)
         try:
             result = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):

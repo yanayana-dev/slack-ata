@@ -300,4 +300,39 @@ if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
 else
   rm -f "$STALL_FLAG"
 fi
+
+# Unit-failure warnings (Neiro's design, adopted 2026-11-19, thread
+# 1795006461.907139): a oneshot that exits non-zero sits in "failed"
+# state until it succeeds again, so `systemctl is-failed` on the
+# sync-check and auto-join units catches hard failures the checks
+# themselves cannot report -- a long failure would otherwise sit
+# unnoticed as only a unit state / jsonl record. The sync-check
+# runner exits 0 after a drift warning is posted, so "failed" here
+# means the check could not run or could not warn; drift itself
+# never trips this. One flag file per unit dedups the warning; it is
+# removed when the unit recovers. Best-effort, never blocks the
+# watchdog: a failed send simply retries on the next run.
+UNIT_FAIL_CHANNEL=${WATCHDOG_UNIT_FAIL_CHANNEL:-C0EXAMPLE001}
+for unit in slack-sync-check.service slack-auto-join.service; do
+  case "$unit" in
+    slack-sync-check.service) role="同期チェック" ;;
+    slack-auto-join.service) role="新チャンネルへの自動参加" ;;
+  esac
+  unit_flag="$BASE/events/unit_failed_${unit%.service}.flag"
+  if systemctl is-failed --quiet "$unit" 2>/dev/null; then
+    if [ ! -f "$unit_flag" ]; then
+      unit_msg="【ユニットの失敗】${unit} が failed 状態です。${role}が動いていません。確認してください。"
+      if "$BASE/bin/slackcli" messages send --recipient-id "$UNIT_FAIL_CHANNEL" --message "$unit_msg" --json >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$unit_flag")"
+        touch "$unit_flag"
+      fi
+    fi
+  elif [ "$(systemctl show -p Result --value "$unit" 2>/dev/null)" = "success" ]; then
+    # 回復は成功した実行でだけ認める: "failed でない" だけだと、タイマー
+    # 発火でユニットが走り直している最中に watchdog が通ってフラグを
+    # 消し、直後に再失敗したときに重複警告してしまう（agy の指摘）。
+    # まだ一度も成功していない／実行中の場合はフラグを残す。
+    rm -f "$unit_flag"
+  fi
+done
 exit 0

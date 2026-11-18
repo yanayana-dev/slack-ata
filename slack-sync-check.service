@@ -9,5 +9,8 @@ Environment=HOME=/path/to
 # proxy variables and hangs on TLS (see slack-auto-join.service).
 Environment=NODE_USE_ENV_PROXY=1
 WorkingDirectory=/path/to/slack-watcher
-ExecStart=/usr/bin/env bash /path/to/slack-watcher/slack-listener-sync-check.sh
+# The runner normalizes exit codes: a drift warning posted to Slack is
+# exit 0, so the unit only goes "failed" when the check itself could
+# not run or could not warn (watchdog's is-failed check escalates that).
+ExecStart=/usr/bin/env bash /path/to/slack-watcher/slack-sync-check-runner.sh
 TimeoutStartSec=300
