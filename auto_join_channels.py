@@ -125,6 +125,12 @@ def _is_good_state(data):
     return all(isinstance(c, str) for c in member + removed)
 
 
+def _is_empty_state(data):
+    """True when a state holds no channels at all."""
+    return (isinstance(data, dict) and data.get("member") == []
+            and data.get("removed") == [])
+
+
 def _normalize(data):
     member = data.get("member") or []
     removed = data.get("removed") or []
@@ -170,12 +176,21 @@ def save_state(state, path=STATE_PATH):
     # Keep the previous good state as a backup before replacing it.
     # Only a file that parses as a good state is backed up: a corrupt
     # main file, or one that lost a key, must never overwrite a good
-    # backup.
-    if _is_good_state(_read_state_file(path)):
-        with open(path, encoding="utf-8") as f:
-            previous = f.read()
-        with open(path + ".bak", "w", encoding="utf-8") as f:
-            f.write(previous)
+    # backup. And a main file that degenerated into a valid-but-empty
+    # state must not clobber a backup that still holds channels
+    # (count check adopted 2026-11-18 from Neiro's be88d0c, narrowed
+    # to save time only: a legitimately empty state cannot coexist
+    # with a non-empty backup -- leaving a channel adds to removed,
+    # re-joining adds to member -- so this has no false positive).
+    current = _read_state_file(path)
+    if _is_good_state(current):
+        backup = _read_state_file(path + ".bak")
+        if not (_is_empty_state(current) and _is_good_state(backup)
+                and not _is_empty_state(backup)):
+            with open(path, encoding="utf-8") as f:
+                previous = f.read()
+            with open(path + ".bak", "w", encoding="utf-8") as f:
+                f.write(previous)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)

@@ -214,6 +214,29 @@ with tempfile.TemporaryDirectory() as d:
     check("saving over a key-missing main file keeps the good backup",
           aj.load_state(p + ".bak") == first)
 
+# Count check (adopted 2026-11-18 from Neiro's be88d0c, narrowed to
+# save time): a valid-but-empty main file must not overwrite a backup
+# that still holds channels; when the backup is empty too, saving
+# proceeds as normal.
+with tempfile.TemporaryDirectory() as d:
+    p = os.path.join(d, "state.json")
+    first = {"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE107"]}
+    aj.save_state(first, p)
+    aj.save_state({"member": ["C0EXAMPLE102"],
+                   "removed": ["C0EXAMPLE107", "C0EXAMPLE110"]}, p)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"member": [], "removed": []}')
+    aj.save_state({"member": ["C0EXAMPLE102"], "removed": ["C0EXAMPLE110"]}, p)
+    check("saving over a valid-but-empty main file keeps a non-empty backup",
+          aj.load_state(p + ".bak") == first)
+with tempfile.TemporaryDirectory() as d:
+    p = os.path.join(d, "state.json")
+    aj.save_state({"member": [], "removed": []}, p)
+    aj.save_state({"member": [], "removed": []}, p)
+    check("empty state with an empty backup still saves normally",
+          aj.load_state(p) == {"member": [], "removed": []}
+          and aj.load_state(p + ".bak") == {"member": [], "removed": []})
+
 # Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py):
 # a member channel with no inbox baseline gets the gap backfill;
 # one with a baseline, a non-member, or an archived/private/DM
