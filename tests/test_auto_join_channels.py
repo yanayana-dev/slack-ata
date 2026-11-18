@@ -152,5 +152,36 @@ with tempfile.TemporaryDirectory() as d:
     check("load_state on corrupt state is empty, not a crash",
           aj.load_state(p) == {"member": [], "removed": []})
 
+# Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py):
+# a member channel with no inbox baseline gets the gap backfill;
+# one with a baseline, a non-member, or an archived/private/DM
+# channel does not.
+with tempfile.TemporaryDirectory() as d:
+    p = os.path.join(d, "inbox.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"channel": "C0EXAMPLE102", "ts": "1.0"}\n')
+        f.write('not json\n')
+        f.write('\n')
+        f.write('{"channel": "C0EXAMPLE109", "ts": "2.0"}\n')
+    check("channels_with_baseline collects channel ids",
+          aj.channels_with_baseline(p) == {"C0EXAMPLE102", "C0EXAMPLE109"})
+    check("channels_with_baseline on a missing file is empty",
+          aj.channels_with_baseline(os.path.join(d, "nope.jsonl")) == set())
+
+NOBASE = {"id": "C0EXAMPLE108", "name": "hand", "is_private": False,
+          "is_archived": False, "is_member": True}
+check("member channel without a baseline needs a seed",
+      [c["id"] for c in aj.needs_baseline_seed(
+          [JOINED, NOBASE], {"C0EXAMPLE102"})] == ["C0EXAMPLE108"])
+check("member channel with a baseline needs no seed",
+      aj.needs_baseline_seed([JOINED], {"C0EXAMPLE102"}) == [])
+check("non-member channel without a baseline is a join, not a heal",
+      aj.needs_baseline_seed([NEW_PUBLIC], set()) == [])
+check("archived member channel without a baseline is not healed",
+      aj.needs_baseline_seed([dict(NOBASE, is_archived=True)], set())
+      == [])
+check("needs_baseline_seed on empty input is empty",
+      aj.needs_baseline_seed([], set()) == [])
+
 print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
 sys.exit(1 if CHECKS[1] else 0)

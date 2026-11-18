@@ -37,6 +37,13 @@ Shape:
     auto-join share (slack-yama 32c07f2a): without this, the 1-minute
     timer would rejoin a channel within a minute of being removed
     from it.
+  * Baseline self-heal (adopted 2026-11-18 from Neiro's auto-join.py,
+    neiro-slack-system): a channel the bot is already a member of but
+    which has no inbox baseline yet -- joined by hand, or a join
+    whose backfill failed -- gets the same 15-minute backfill, so the
+    gap is closed retroactively instead of left open. Channels with
+    a baseline are untouched, so this costs one backfill run at most
+    until the first message lands.
   * Every join is appended to events/auto_join.jsonl. Failures are
     reported on stderr and in the exit code, but one failing channel
     does not stop the others.
@@ -58,6 +65,7 @@ SLACKCLI = os.path.join(BASE, "bin", "slackcli")
 EVENTS = os.path.join(BASE, "events")
 LOG_PATH = os.path.join(EVENTS, "auto_join.jsonl")
 STATE_PATH = os.path.join(EVENTS, "auto_join_state.json")
+INBOX_PATH = os.path.join(EVENTS, "inbox.jsonl")
 WORKSPACE = "muse-board"
 GREETING = ("Yanayanaです。新しいチャンネルに参加しました！"
             "よろしくお願いします。投稿があれば返信やお手伝いをしますね。")
@@ -163,6 +171,56 @@ def joinable(conversations, removed=frozenset()):
     return out
 
 
+def channels_with_baseline(inbox_path=INBOX_PATH):
+    """Channel ids that already have at least one inbox line.
+
+    A missing or unreadable inbox means "no baseline anywhere";
+    malformed lines are skipped, never a crash.
+    """
+    baselines = set()
+    try:
+        with open(inbox_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                cid = rec.get("channel") or ""
+                if cid:
+                    baselines.add(cid)
+    except OSError:
+        return set()
+    return baselines
+
+
+def needs_baseline_seed(conversations, baselines):
+    """Member channels with no inbox baseline yet (pure filter).
+
+    These are channels the bot already belongs to -- joined by hand,
+    or a join whose backfill failed -- where the listener has never
+    recorded a message, so the join gap was never closed.
+    """
+    baselines = set(baselines or [])
+    out = []
+    for conv in conversations or []:
+        cid = conv.get("id") or ""
+        if not cid.startswith("C"):
+            continue
+        if conv.get("is_private"):
+            continue
+        if conv.get("is_archived"):
+            continue
+        if not conv.get("is_member"):
+            continue
+        if cid in baselines:
+            continue
+        out.append(conv)
+    return out
+
+
 def list_conversations(runner=subprocess.run):
     proc = runner(
         [SLACKCLI, "conversations", "list", "--workspace", WORKSPACE,
@@ -261,6 +319,11 @@ def main(argv=None):
         except Exception as e:
             print(f"auto_join: state save failed: {e}", file=sys.stderr)
     targets = joinable(conversations, removed=new_state["removed"])
+    # Baseline snapshot is taken before any join, so a channel joined
+    # in this run is never also "healed": the listing says it is not
+    # a member yet, so needs_baseline_seed() excludes it anyway.
+    heal_targets = needs_baseline_seed(conversations,
+                                       channels_with_baseline())
     joined = 0
     failed = 0
     for conv in targets:
@@ -286,6 +349,21 @@ def main(argv=None):
         print(f"auto_join: joined {cid} ({name}) greeted={greeted} "
               f"backfill={backfill}")
         joined += 1
+    # Baseline self-heal: member channels with no inbox baseline get
+    # the same 15-minute backfill (best effort, never fails the run).
+    # No greeting here: the bot is already a member.
+    for conv in heal_targets:
+        cid = conv["id"]
+        name = conv.get("name") or ""
+        if dry_run:
+            print(f"auto_join: would seed baseline for {cid} ({name})")
+            continue
+        backfill = backfill_channel(cid)
+        record({"at": datetime.now(timezone.utc).isoformat(),
+                "channel": cid, "name": name, "baseline_seed": True,
+                "backfill": backfill})
+        print(f"auto_join: seeded baseline for {cid} ({name}) "
+              f"backfill={backfill}")
     if failed:
         return 1
     return 0
