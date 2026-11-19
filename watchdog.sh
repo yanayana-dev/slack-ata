@@ -37,6 +37,16 @@ STATE_FILE=${WATCHDOG_STATE_FILE:-$BASE/events/watchdog_reinstall.state}
 MAX_ATTEMPTS=3
 BACKOFF_BASE=30
 
+# Reader-side guard (adopted 2026-11-19 from Yama's share in thread
+# 1795064369.469599): before restarting the listener, check that
+# listener.py still compiles. Python files are edited directly (not
+# atomically), so a half-written file must not kill the running
+# process -- the restart is skipped for this cycle and the next
+# cycle retries once the edit is complete.
+listener_py_ok() {
+  [ -f "$BASE/listener.py" ] && python3 -m py_compile "$BASE/listener.py" 2>/dev/null
+}
+
 # Hook health check (adopted 2026-11-15 from Neiro's check-script share):
 # syntax of ~/hooks/scripts/*.sh and JSON of ~/hooks/definitions/*.json;
 # warns to Slack on new/changed failures. Never blocks the watchdog.
@@ -247,8 +257,12 @@ fi
 # alone does not affect the running service), so restart right away and
 # let the next run verify health instead of restarting twice.
 if [ "$listener_reinstalled" = 1 ]; then
-  systemctl restart "$UNIT" >/dev/null 2>&1
-  exit 0
+  if listener_py_ok; then
+    systemctl restart "$UNIT" >/dev/null 2>&1
+    exit 0
+  else
+    echo "watchdog: listener.py does not compile; skipping restart after reinstall" >&2
+  fi
 fi
 if [ "$watchdog_reinstalled" = 1 ]; then
   systemctl restart slack-listener-watchdog.timer >/dev/null 2>&1
@@ -297,8 +311,12 @@ if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
     last_restart=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
     case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
     if [ $(( now - last_restart )) -ge 60 ]; then
-      if systemctl restart "$UNIT" >/dev/null 2>&1; then
-        echo "$now" > "$COOLDOWN_FILE"
+      if listener_py_ok; then
+        if systemctl restart "$UNIT" >/dev/null 2>&1; then
+          echo "$now" > "$COOLDOWN_FILE"
+        fi
+      else
+        echo "watchdog: listener.py does not compile; skipping restart" >&2
       fi
     fi
   fi
