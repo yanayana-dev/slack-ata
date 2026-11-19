@@ -51,6 +51,21 @@ Shape:
   * Every join is appended to events/auto_join.jsonl. Failures are
     reported on stderr and in the exit code, but one failing channel
     does not stop the others.
+  * Every run (except --dry-run) overwrites
+    events/auto_join_last_status.json with just the latest run:
+    ended_at, status, channels checked, channels joined, baselines
+    seeded, errors, and transient_retries -- the retries absorbed
+    by a successful read. A run that dies mid-way leaves the file
+    stale, which is itself the signal. Adopted 2026-11-19 from
+    Yama's self-review share (candidate 10 + transient_retries):
+    until then a successful run was silent, so the log could not
+    tell a success from a crash, and absorbed read failures were
+    indistinguishable from real ones. The retry count follows
+    Yama's definition: attempts-minus-one on successful calls
+    only; a call that ultimately fails counts as one error and
+    its attempts are not counted, so nothing is double-counted.
+    Retries inside the Slack SDK itself are invisible here and
+    are not included -- read the number as a lower bound.
   * Runs from slack-auto-join.timer every 1 minute.
 
 slackcli stores its profile under $HOME/.config/slackcli. The
@@ -62,6 +77,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -69,6 +85,7 @@ SLACKCLI = os.path.join(BASE, "bin", "slackcli")
 EVENTS = os.path.join(BASE, "events")
 LOG_PATH = os.path.join(EVENTS, "auto_join.jsonl")
 STATE_PATH = os.path.join(EVENTS, "auto_join_state.json")
+STATUS_PATH = os.path.join(EVENTS, "auto_join_last_status.json")
 INBOX_PATH = os.path.join(EVENTS, "inbox.jsonl")
 WORKSPACE = "muse-board"
 GREETING = ("Yanayanaです。新しいチャンネルに参加しました！"
@@ -373,6 +390,53 @@ def backfill_channel(channel_id, runner=subprocess.run):
         return {"recovered": None, "checked": None, "errors": ["unparsable"]}
 
 
+def list_conversations_with_retries(list_fn=None, max_attempts=5,
+                                    sleep=time.sleep):
+    """List conversations, retrying a failing read.
+
+    Returns (conversations, transient_retries): the retry count is
+    the attempts-minus-one absorbed by the successful call, and 0
+    when the first attempt succeeds. When every attempt fails the
+    last error is raised and no retries are counted -- that call is
+    one error in the status file, not retries, so nothing is
+    double-counted (Yama's definition, adopted 2026-11-19).
+    """
+    fn = list_fn or list_conversations
+    last = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(), attempt - 1
+        except Exception as e:
+            last = e
+            if attempt < max_attempts:
+                sleep(min(2 ** (attempt - 1), 8))
+    raise last
+
+
+def status_record(status, checked, joined, seeded, errors,
+                  transient_retries):
+    """One run's result for the last-status file."""
+    return {"ended_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "checked": checked,
+            "joined": joined,
+            "seeded": seeded,
+            "errors": errors,
+            "transient_retries": transient_retries}
+
+
+def write_status(record, path=STATUS_PATH):
+    """Overwrite the last-status file atomically; never raises."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"auto_join: status write failed: {e}", file=sys.stderr)
+
+
 def record(entry):
     os.makedirs(EVENTS, exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -384,9 +448,12 @@ def main(argv=None):
     dry_run = "--dry-run" in argv
     no_greet = "--no-greet" in argv
     try:
-        conversations = list_conversations()
+        conversations, transient_retries = \
+            list_conversations_with_retries()
     except Exception as e:
         print(f"auto_join: {e}", file=sys.stderr)
+        if not dry_run:
+            write_status(status_record("error", 0, 0, 0, 1, 0))
         return 2
     try:
         state = load_state()
@@ -396,6 +463,9 @@ def main(argv=None):
         print(f"auto_join: {e}", file=sys.stderr)
         record({"at": datetime.now(timezone.utc).isoformat(),
                 "error": str(e)})
+        if not dry_run:
+            write_status(status_record(
+                "error", len(conversations), 0, 0, 1, transient_retries))
         return 2
     new_state = update_removed(conversations, state)
     newly_removed = (set(new_state["removed"])
@@ -442,6 +512,7 @@ def main(argv=None):
     # Baseline self-heal: member channels with no inbox baseline get
     # the same 15-minute backfill (best effort, never fails the run).
     # No greeting here: the bot is already a member.
+    seeded = 0
     for conv in heal_targets:
         cid = conv["id"]
         name = conv.get("name") or ""
@@ -454,6 +525,12 @@ def main(argv=None):
                 "backfill": backfill})
         print(f"auto_join: seeded baseline for {cid} ({name}) "
               f"backfill={backfill}")
+        seeded += 1
+    if not dry_run:
+        write_status(status_record(
+            "success" if not failed else "error",
+            len(conversations), joined, seeded, failed,
+            transient_retries))
     if failed:
         return 1
     return 0

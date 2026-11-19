@@ -11,6 +11,7 @@ Run:
   python3 tests/test_auto_join_channels.py
 Exit 0 when every check passes; each check prints PASS/FAIL.
 """
+import json
 import os
 import sys
 
@@ -267,6 +268,110 @@ check("archived member channel without a baseline is not healed",
       == [])
 check("needs_baseline_seed on empty input is empty",
       aj.needs_baseline_seed([], set()) == [])
+
+# Last-status file + transient_retries (adopted 2026-11-19 from
+# Yama's self-review share, candidate 10): every run overwrites
+# one status file (never on --dry-run), and retries absorbed by a
+# successful read are counted separately from final errors.
+def flaky_list_fn(failures, result):
+    calls = [0]
+
+    def fn():
+        calls[0] += 1
+        if calls[0] <= failures:
+            raise RuntimeError("Remote end closed")
+        return result
+    return fn
+
+
+check("retries: first attempt success counts 0",
+      aj.list_conversations_with_retries(
+          list_fn=flaky_list_fn(0, [NEW_PUBLIC]),
+          sleep=lambda s: None) == ([NEW_PUBLIC], 0))
+check("retries: two absorbed failures count 2",
+      aj.list_conversations_with_retries(
+          list_fn=flaky_list_fn(2, [NEW_PUBLIC]),
+          sleep=lambda s: None) == ([NEW_PUBLIC], 2))
+def _raises(fn):
+    try:
+        fn()
+    except RuntimeError:
+        return True
+    return False
+
+
+check("retries: a failing read raises after max attempts",
+      _raises(lambda: aj.list_conversations_with_retries(
+          list_fn=flaky_list_fn(99, []), max_attempts=3,
+          sleep=lambda s: None)))
+
+
+with tempfile.TemporaryDirectory() as d:
+    p = os.path.join(d, "last_status.json")
+    rec = aj.status_record("success", 3, 0, 0, 0, 1)
+    check("status_record carries the run fields",
+          rec["status"] == "success" and rec["checked"] == 3
+          and rec["transient_retries"] == 1 and "ended_at" in rec)
+    aj.write_status(rec, p)
+    check("write_status round-trips the record",
+          json.load(open(p, encoding="utf-8")) == rec)
+    aj.write_status(aj.status_record("error", 0, 0, 0, 1, 0), p)
+    check("write_status overwrites with just the latest run",
+          json.load(open(p, encoding="utf-8"))["status"] == "error")
+
+# main() writes the status file: a normal run (one join, no heal),
+# a failing list read (error status), and a dry run (no file).
+with tempfile.TemporaryDirectory() as d:
+    orig = {k: getattr(aj, k) for k in
+            ("list_conversations", "load_state", "save_state",
+             "join_channel", "greet", "backfill_channel",
+             "channels_with_baseline", "STATUS_PATH", "LOG_PATH",
+             "write_status")}
+    try:
+        aj.STATUS_PATH = os.path.join(d, "last_status.json")
+        aj.LOG_PATH = os.path.join(d, "auto_join.jsonl")
+        _orig_write_status = orig["write_status"]
+        # write_status binds its default path at def time, so route
+        # the test run's writes at the patched STATUS_PATH.
+        aj.write_status = lambda rec: _orig_write_status(
+            rec, aj.STATUS_PATH)
+        aj.load_state = lambda path=aj.STATE_PATH: {
+            "member": ["C0EXAMPLE102"], "removed": []}
+        aj.save_state = lambda state, path=aj.STATE_PATH: None
+        aj.join_channel = lambda cid, runner=None: {"is_member": True}
+        aj.greet = lambda cid, runner=None: True
+        aj.backfill_channel = lambda cid, runner=None: {
+            "recovered": 0, "checked": 0, "errors": []}
+        aj.channels_with_baseline = lambda p=aj.INBOX_PATH: {
+            "C0EXAMPLE102"}
+        aj.list_conversations = lambda runner=None: [
+            dict(NEW_PUBLIC), dict(JOINED)]
+        check("main writes a success status on a normal run",
+              aj.main([]) == 0
+              and json.load(open(aj.STATUS_PATH,
+                                  encoding="utf-8"))["status"] == "success"
+              and json.load(open(aj.STATUS_PATH,
+                                  encoding="utf-8"))["joined"] == 1
+              and json.load(open(aj.STATUS_PATH,
+                                  encoding="utf-8"))["checked"] == 2)
+
+        def failing_list(runner=None):
+            raise RuntimeError("Remote end closed")
+        aj.list_conversations = failing_list
+        check("main writes an error status when the list fails",
+              aj.main([]) == 2
+              and json.load(open(aj.STATUS_PATH,
+                                  encoding="utf-8"))["status"] == "error"
+              and json.load(open(aj.STATUS_PATH,
+                                  encoding="utf-8"))["errors"] == 1)
+        os.remove(aj.STATUS_PATH)
+        aj.list_conversations = lambda runner=None: [dict(JOINED)]
+        check("main writes no status file on a dry run",
+              aj.main(["--dry-run"]) == 0
+              and not os.path.exists(aj.STATUS_PATH))
+    finally:
+        for k, v in orig.items():
+            setattr(aj, k, v)
 
 print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
 sys.exit(1 if CHECKS[1] else 0)
