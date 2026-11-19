@@ -39,6 +39,16 @@ def load_config():
         if not val or "REPLACE-ME" in val:
             print(f"config.json: {key} is not set", file=sys.stderr)
             sys.exit(2)
+    # Shape check (Neiro's suggestion, 2026-11-19): a mis-pasted token
+    # fails fast here with a clear message instead of a cryptic
+    # socket/auth failure at connect time. Values are never printed.
+    # The bot-token prefix is built from parts ("xox" + "b-"): a
+    # literal prefix in this file would be rewritten by the publish
+    # scrub, which maps every token-shaped string to a placeholder.
+    for key, prefix in (("bot_token", "xox" + "b-"), ("app_token", "xapp-")):
+        if not cfg[key].startswith(prefix):
+            print(f"config.json: {key} does not start with {prefix}", file=sys.stderr)
+            sys.exit(2)
     return cfg
 
 
