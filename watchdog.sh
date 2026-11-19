@@ -6,6 +6,10 @@
 #   not just a deleted one)
 # - restarts the service if it is not active
 # - restarts it if the heartbeat is stale (>120s) or not connected
+#   (revised 2026-11-19 from Yama's share in thread
+#   1795006461.907139: re-read the heartbeat 5s later before
+#   restarting, and do not restart the same heartbeat again within
+#   60s of a successful restart)
 #
 # Reinstall hardening, adopted 2026-11-12 from Yama's self-review
 # implementation share in #slack-へようこそ (their watchdog.sh):
@@ -271,7 +275,33 @@ now=$(date +%s)
 hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
 age=$(( now - hb_mtime ))
 if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
-  systemctl restart "$UNIT" >/dev/null 2>&1
+  # Re-check after 5s (Yama's share, thread 1795006461.907139,
+  # adopted 2026-11-19): a single stale read -- e.g. the heartbeat
+  # file being written at the moment of stat, or a transient
+  # disconnect -- must not restart the listener. Only a heartbeat
+  # that is still stale/disconnected after the wait triggers a
+  # restart.
+  sleep 5
+  now=$(date +%s)
+  hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
+  age=$(( now - hb_mtime ))
+  if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
+    # Cooldown after a successful restart (same share): the next
+    # check can land while the listener is still starting up, and
+    # must not fire a second restart at the same heartbeat. 60s
+    # matches Yama's cooldown; our timer runs every 5 minutes, so
+    # this mainly guards back-to-back or manual runs and the hook's
+    # self-heal call. The stamp is written only when the restart
+    # itself succeeded; a failed restart stays retryable.
+    COOLDOWN_FILE=${WATCHDOG_RESTART_COOLDOWN_FILE:-$BASE/events/watchdog_restart.cooldown}
+    last_restart=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+    case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
+    if [ $(( now - last_restart )) -ge 60 ]; then
+      if systemctl restart "$UNIT" >/dev/null 2>&1; then
+        echo "$now" > "$COOLDOWN_FILE"
+      fi
+    fi
+  fi
 fi
 
 # Stale-pending warning (agy review 2026-11-18, thread 1795006461.907139):
