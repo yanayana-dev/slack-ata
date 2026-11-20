@@ -387,6 +387,28 @@ def test_get_curl_retries():
         post_metadata._curl_get_json = real_curl
 
 
+def test_get_curl_retries_rc6():
+    # rc=6 (name resolution failure) is reproduced the same way as
+    # rc=7: ("error", "curl rc=6: ...") raises _CurlError, and the
+    # retry ladder treats every _CurlError identically, so one retry
+    # (1s) then success.
+    page = {"ok": True, "messages": [_meta_msg("1000.000000", text="parent")],
+            "has_more": False, "response_metadata": {}}
+    fake = FakeCurl([("error", "curl rc=6: name resolution failed"),
+                     ("ok", page)])
+    real_curl = post_metadata._curl_get_json
+    post_metadata._curl_get_json = fake
+    try:
+        msgs = post_metadata.read_thread(CHANNEL, THREAD_TS, FAKE_TOKEN,
+                                         sleep=fake.sleep)
+        check("curl GET retries rc=6 name-resolution errors",
+              len(msgs) == 1 and len(fake.calls) == 2
+              and fake.sleeps == [1],
+              f"calls={len(fake.calls)} sleeps={fake.sleeps}")
+    finally:
+        post_metadata._curl_get_json = real_curl
+
+
 def test_get_curl_falls_back_without_binary():
     # No curl binary and no injected urlopen: the urllib path is
     # used unchanged (urllib itself is stubbed here, not bypassed).
@@ -669,6 +691,7 @@ def main():
     test_read_thread_paging()
     test_get_uses_curl()
     test_get_curl_retries()
+    test_get_curl_retries_rc6()
     test_get_curl_falls_back_without_binary()
     test_get_curl_vanishing_falls_back()
     test_get_curl_http_errors()
