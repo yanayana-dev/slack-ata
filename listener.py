@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 
 import dm_poll
+import inbox_state
 import seen_state
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -54,9 +55,11 @@ def load_config():
 
 
 def append_inbox(record):
-    os.makedirs(os.path.dirname(INBOX_PATH), exist_ok=True)
-    with open(INBOX_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Append-if-absent by (channel, ts), shared with backfill.py
+    # (inbox_state.append_record_unique): the two writers' seen-set
+    # check-then-append raced on bursts and duplicated inbox lines.
+    # Returns True when this call appended the line.
+    return inbox_state.append_record_unique(INBOX_PATH, record)
 
 
 def is_user_dm_event(payload, event):
@@ -237,9 +240,18 @@ def main():
         while len(seen_order) > SEEN_MAX:
             seen_set.discard(seen_order.pop(0))
         try:
+            # Merge with the on-disk list before saving (union_seen):
+            # backfill.py writes the same file, and saving our own
+            # snapshot alone would drop keys it added since our last
+            # refresh -- a dropped ts: key re-admits a redelivery.
             # Atomic write that also keeps the previous good file as
             # .bak (seen_state.py).
-            seen_state.save_seen(seen_order, SEEN_PATH)
+            disk = seen_state.load_seen(SEEN_PATH)
+            merged = seen_state.union_seen(disk, seen_order)[-SEEN_MAX:]
+            seen_order[:] = merged
+            seen_set.clear()
+            seen_set.update(merged)
+            seen_state.save_seen(merged, SEEN_PATH)
         except Exception:
             pass
 

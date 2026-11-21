@@ -65,6 +65,26 @@ def load_seen(path):
     return []
 
 
+def union_seen(disk, own):
+    """Union of two seen lists: disk order first, then own-only keys.
+
+    Both writers of the seen file (listener.py, backfill.py) used to
+    save their own full snapshot, so whichever saved last silently
+    dropped keys the other had added in between -- and a dropped
+    ts: key lets a later redelivery be admitted a second time.
+    Merging with the on-disk list before saving makes every save
+    union-only: keys are never lost, only added. Callers trim the
+    result to their SEEN_MAX.
+    """
+    out = list(disk)
+    have = set(out)
+    for key in own:
+        if key not in have:
+            have.add(key)
+            out.append(key)
+    return out
+
+
 def save_seen(order, path):
     """Persist the seen list, keeping the previous good one as .bak."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

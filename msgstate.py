@@ -19,7 +19,15 @@ safe only because replies are idempotent (reply_once.py checks the
 thread before sending, so a re-run never double-posts).
 
 Usage:
-  msgstate.py pending        # JSON list of pending/failed messages
+  msgstate.py pending [--limit N | --all]
+                             # JSON list of pending/failed messages,
+                             # oldest first, capped at
+                             # DEFAULT_PENDING_LIMIT unless --limit N
+                             # or --all is given (see below)
+  msgstate.py touch KEY      # refresh a processing entry's
+                             # updated_at (claim heartbeat; attempts
+                             # unchanged) so long single-item work is
+                             # not swept as stale mid-flight
   msgstate.py count-pending  # just the number
   msgstate.py oldest-pending-age  # seconds since the oldest pending
                                   # message arrived (empty when none)
@@ -66,6 +74,16 @@ MAX_ATTEMPTS = 3
 # a worker that claimed a message but never finished within 10 minutes
 # is presumed crashed; the poller reclaims it on the next poll.
 TIMEOUT_SECS = 600
+# Per-wake batch cap (burst fix, 2026-11-21): `pending` hands a worker
+# at most this many messages, oldest first. The uncapped list made one
+# wake try to chew a whole burst of long posts in a single agent run;
+# when that run died or was cut off, its claims sat in processing
+# until the 600s sweep, burned attempts, and eventually dead-lettered
+# (the 2026-11-12 / 2026-11-18 dead letters all have this shape).
+# Leftovers stay pending and re-wake on the next 30s poll, so a burst
+# drains over several bounded runs instead of one monster run.
+# count-pending / oldest-pending-age always see the full backlog.
+DEFAULT_PENDING_LIMIT = 3
 
 
 @contextmanager
@@ -167,7 +185,7 @@ def read_inbox():
     return out
 
 
-def pending_items(state=None):
+def pending_items(state=None, limit=None):
     if state is None:
         state = load_state()
     # Group duplicate inbox lines for the same Slack message. A message
@@ -208,6 +226,10 @@ def pending_items(state=None):
             "attempts": max(s.get("attempts", 0) for _, s in sts),
             "message": rec,
         })
+    if limit is not None:
+        # Items are built in inbox order (oldest first), so the cap
+        # keeps the oldest work and defers the rest to the next wake.
+        items = items[:limit]
     return items
 
 
@@ -269,12 +291,53 @@ def cmd_stats():
                          ensure_ascii=False, indent=1))
 
 
-def cmd_pending():
+def cmd_pending(argv):
+    limit = DEFAULT_PENDING_LIMIT
+    if "--all" in argv:
+        limit = None
+    elif "--limit" in argv:
+        i = argv.index("--limit")
+        try:
+            limit = int(argv[i + 1])
+            if limit < 1:
+                raise ValueError
+        except (IndexError, ValueError):
+            print("usage: pending [--limit N | --all]", file=sys.stderr)
+            return 2
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
-        items = pending_items(state)
+        items = pending_items(state, limit=limit)
     print(json.dumps(items, ensure_ascii=False, indent=1))
+    return 0
+
+
+def cmd_touch(argv):
+    """Refresh a processing entry's updated_at (claim heartbeat).
+
+    A worker on a legitimately long single item (implementing a
+    shared fix, running tests) calls this between steps so the 600s
+    stale sweep does not reclaim the claim mid-flight and hand the
+    same message to a second worker. Attempts are NOT incremented --
+    this is not a new try, just proof of life. Anything that is not
+    currently processing (pending/done/dead/absent) is left exactly
+    as it is and its status is printed.
+    """
+    if len(argv) < 1:
+        print("usage: touch KEY", file=sys.stderr)
+        return 2
+    key = argv[0]
+    with state_lock(exclusive=True):
+        state = load_state()
+        st = state.get(key)
+        if not st or st.get("status") != "processing":
+            print(st.get("status") if st else "absent")
+            return 0
+        st["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state[key] = st
+        save_state(state)
+    print("touched")
+    return 0
 
 
 def cmd_count():
@@ -423,8 +486,9 @@ def main():
         return 2
     cmd = sys.argv[1]
     if cmd == "pending":
-        cmd_pending()
-        return 0
+        return cmd_pending(sys.argv[2:])
+    if cmd == "touch":
+        return cmd_touch(sys.argv[2:])
     if cmd == "count-pending":
         cmd_count()
         return 0

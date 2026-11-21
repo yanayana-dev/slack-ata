@@ -143,5 +143,16 @@ with tempfile.TemporaryDirectory() as tmp:
         backfill.SEEN_MAX = old_max
         backfill.SEEN_PATH = old_path
 
+    # 12. union_seen (2026-11-21 burst fix): disk order first, then
+    # own-only keys; nothing on either side is ever dropped.
+    check("union_seen keeps disk order and appends own-only keys",
+          seen_state.union_seen(["a", "b"], ["b", "c"]) == ["a", "b", "c"])
+    check("union_seen with empty disk is own list",
+          seen_state.union_seen([], ["x", "y"]) == ["x", "y"])
+    check("union_seen with empty own is disk list",
+          seen_state.union_seen(["x"], []) == ["x"])
+    check("union_seen dedupes within own",
+          seen_state.union_seen(["a"], ["b", "b", "a"]) == ["a", "b"])
+
 print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")
 sys.exit(1 if CHECKS[1] else 0)

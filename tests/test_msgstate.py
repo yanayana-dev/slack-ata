@@ -297,6 +297,61 @@ def main():
     check("staleな処理中はpendingへ戻してから測る",
           age is not None and 190 <= age <= 220, f"got {age}")
 
+    # 13. バースト対策 (2026-11-21): pending の既定上限と touch。
+    # 1回の wake がバースト全件を抱えると、その run が死んだときに
+    # claim がまとめて stale 化し attempt を浪費する。上限で run を
+    # 小さく保ち、残りは次の poll で再 wake させる。
+    def pending_raw(base, args):
+        r = run(["pending"] + args, base)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)
+
+    def count_pending(base):
+        r = run(["count-pending"], base)
+        assert r.returncode == 0, r.stderr
+        return int(r.stdout.strip())
+
+    def touch(base, key):
+        r = run(["touch", key], base)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    base13 = make_base([msg(f"EvB{i}", f"1794478306.00001{i}")
+                        for i in range(1, 6)])
+    items = pending(base13)
+    check("バースト時もpendingは既定で3件まで", len(items) == 3,
+          f"got {len(items)}")
+    check("上限内は古い順に返る",
+          [it["key"] for it in items] == ["EvB1", "EvB2", "EvB3"])
+    check("--allで全件返る", len(pending_raw(base13, ["--all"])) == 5)
+    check("--limit 2で2件返る",
+          len(pending_raw(base13, ["--limit", "2"])) == 2)
+    check("count-pendingは上限の影響を受けない",
+          count_pending(base13) == 5)
+    mark(base13, "EvB1", "done")
+    items = pending(base13)
+    check("先頭がdoneになると上限枠が次へずれる",
+          [it["key"] for it in items] == ["EvB2", "EvB3", "EvB4"])
+
+    base14 = make_base([msg("EvT1", "1794478306.000021")])
+    mark(base14, "EvT1", "processing")
+    set_stale(base14, "EvT1", 1)  # processing, attempts=1, updated 1200s ago
+    check("touchはtouchedを返す", touch(base14, "EvT1") == "touched")
+    st = state(base14)["EvT1"]
+    check("touchでattemptsは増えない", st["attempts"] == 1)
+    updated = datetime.fromisoformat(st["updated_at"])
+    check("touchでupdated_atが新しくなる",
+          (datetime.now(timezone.utc) - updated).total_seconds() < 60)
+    check("touch後はsweepで差し戻されない", pending(base14) == [])
+    mark(base14, "EvT1", "done")
+    check("doneへのtouchはdoneを返し状態を変えない",
+          touch(base14, "EvT1") == "done"
+          and state(base14)["EvT1"]["status"] == "done")
+    check("不在キーへのtouchはabsentを返す",
+          touch(base14, "EvNope") == "absent")
+    check("不在キーへのtouchは状態を作らない",
+          "EvNope" not in state(base14))
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1

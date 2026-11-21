@@ -204,9 +204,12 @@ def compute_floor(seen_order, floor_arg=None, window_minutes=None, now=None):
 
 
 def append_inbox(record):
-    os.makedirs(EVENTS, exist_ok=True)
-    with open(INBOX, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Append-if-absent by (channel, ts), shared with listener.py
+    # (inbox_state.append_record_unique): this run's seen snapshot
+    # can predate a socket admission of the same message, and the
+    # plain append then duplicated the inbox line. Returns True
+    # when this call appended the line.
+    return inbox_state.append_record_unique(INBOX, record)
 
 
 def main():
@@ -317,10 +320,14 @@ def main():
             "subtype": msg.get("subtype"),
             "source": "backfill",
         }
-        append_inbox(record)
+        if append_inbox(record):
+            recovered += 1
+        # The key is remembered either way: when the append was a
+        # no-op the message is already in the inbox (the listener
+        # admitted it first), which is exactly what the seen set
+        # exists to record.
         seen_set.add(key)
         seen_order.append(key)
-        recovered += 1
 
     for channel in channels:
         try:
@@ -355,7 +362,11 @@ def main():
                 admit(channel, msg)
 
     if recovered:
-        save_seen(seen_order)
+        # Merge with the on-disk list before saving (union_seen):
+        # the listener may have added keys while this run was
+        # reading history, and saving this run's snapshot alone
+        # would drop them (a dropped ts: key re-admits a redelivery).
+        save_seen(seen_state.union_seen(load_seen(), seen_order))
 
     print(json.dumps(
         {"recovered": recovered, "checked": checked, "errors": errors},

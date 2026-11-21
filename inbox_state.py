@@ -43,6 +43,7 @@ the thread before sending, so no reply is ever double-posted, but a
 task-type message could be re-executed. The window is bounded by the
 snapshot age, and only a real corruption triggers this path at all.
 """
+import fcntl
 import json
 import os
 import time
@@ -213,6 +214,49 @@ def read_recovery_marker(inbox_path):
         return None
     return {"bak_newest_ts": ts,
             "restored_at": marker.get("restored_at")}
+
+
+def append_record_unique(path, record):
+    """Append one record to a .jsonl inbox unless already present.
+
+    Presence is by (channel, ts) -- the message is the unit of work,
+    not the delivery (burst fix, 2026-11-21): the socket listener and
+    backfill.py both admit channel messages, and their seen-set
+    check-then-append raced whenever both ran over the same burst
+    (VM-replacement recovery makes them overlap), landing the same
+    message in the inbox twice under different event_ids -- observed
+    2026-11-21 21:53-21:55 JST, when ~9 posts arrived within minutes
+    and several appear twice in inbox.jsonl (one source "backfill",
+    one socket). The presence check and the append now happen under
+    one flock (path + ".lock"), so two writers in different
+    processes cannot both pass the check. The scan is O(lines) per
+    append; the inbox is ~1k lines and appends are per-message, so
+    this stays cheap.
+
+    Returns True when the record was appended. A record without a
+    ts cannot be keyed and is always appended (channel-message
+    records always carry one; anything else keeps the old
+    append-only behavior rather than being dropped). An inbox that
+    cannot be read at all (missing file) counts as empty.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lock_path = path + ".lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        key = (record.get("channel"), record.get("ts"))
+        if key[1]:
+            parsed = _parse_lines(path)
+            if parsed is not None and key in inbox_keys(parsed[0]):
+                return False
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def consume_recovery_marker(inbox_path):
