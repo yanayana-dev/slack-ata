@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/path/to/slack-watcher/proxy.env
+Environment=HOME=/path/to
 WorkingDirectory=/path/to/slack-watcher
 ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/listener.py
 Restart=always

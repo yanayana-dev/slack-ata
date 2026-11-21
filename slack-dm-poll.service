@@ -4,5 +4,6 @@ Description=Poll Ata's Slack DMs via the user-token connector (dm_poll.py)
 [Service]
 Type=oneshot
 EnvironmentFile=/path/to/slack-watcher/proxy.env
+Environment=HOME=/path/to
 WorkingDirectory=/path/to/slack-watcher
 ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/dm_poll.py --helper /path/to/slack-user-helper/slack_user_api.py
