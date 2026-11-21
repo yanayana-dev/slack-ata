@@ -108,7 +108,7 @@ check_one() {
     return
   fi
   if ! cmp -s "$scrubbed" "$pub"; then
-    failures+=("DRIFT: $live （公開用コピーと内容が違う。稼働中の変更を公開用へ戻すか、公開用の変更を稼働中へ反映すること）")
+    failures+=("DRIFT: $live （公開用コピーと内容が違う。稼働側が正本なので、稼働中の内容で公開用コピーを作り直すこと）")
     PROBLEMS=$((PROBLEMS + 1))
   fi
   case "$rel" in
@@ -184,7 +184,7 @@ fi
 
 msg="【リスナー同期チェック】稼働中の ~/workspace/slack-listener と公開用コピーの内容がずれています（専用タイマー slack-sync-check.timer で5分間隔で確認中）:
 $text
-稼働中の変更を公開用へ戻すか、公開用の変更を稼働中へ反映してください。"
+稼働側が正本です。稼働中の内容で公開用コピーを作り直してください。"
 if [ "$DRY_RUN" = "1" ]; then
   echo "would warn to $CHANNEL:"
   printf '%s\n' "$msg"
