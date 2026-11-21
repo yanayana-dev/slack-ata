@@ -121,6 +121,17 @@ def load(path=None):
                     # good lines still load.
                     print(f"load: skipping corrupt line {lineno} "
                           f"in {path}: {line[:120]!r}", file=sys.stderr)
+                    # 2026-11-22, Yama's proposal (same thread): note
+                    # the sighting for the daily summary (ledger_health),
+                    # never a dedicated log file. Lazy import so a
+                    # missing/broken helper can never break the load.
+                    try:
+                        if BASE not in sys.path:
+                            sys.path.insert(0, BASE)
+                        from ledger_health import note_corrupt_line
+                        note_corrupt_line(path, lineno)
+                    except Exception:
+                        pass
                     continue
     return out
 
