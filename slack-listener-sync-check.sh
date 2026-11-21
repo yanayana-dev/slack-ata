@@ -12,8 +12,9 @@
 # scrub.sed をかけた一時コピーと公開用コピーを比べる。
 #
 # 検証するもの（対象は公開用コピーにあるトップレベルの *.py, *.sh,
-# *.service, *.timer と tests/*.py。稼働中にだけある config.json /
-# oauth_helper_server.py / proxy.env / bin/ / events/ は対象外）:
+# *.service, *.timer と tests/ 以下の *.py（再帰）。稼働中にだけある
+# config.json / oauth_helper_server.py / proxy.env / bin/ / events/
+# は対象外）:
 #   1. 公開用コピーにあるファイルに対応する稼働中のファイルが存在すること
 #   2. scrub 後の内容が一致すること
 #   3. .py は両方とも py_compile を通り、.sh は両方とも bash -n を通ること
@@ -24,6 +25,17 @@
 # tests/ は 2026-11-21 に範囲へ追加した。以前はトップレベルのみで、
 # tests/ のずれ（例：2026-11-20 の curl rc=6 再現テスト）は見逃していた。
 # tests/ の .bak は対象外（拡張子が .py ではないため拾われない）。
+# tests/ はサブディレクトリも含めて再帰で照合する（2026-11-21、
+# Neiroさんの確認への答え：maxdepth 1 だと将来のサブディレクトリの
+# テストやテスト用データで同じ見逃しが起きる）。
+# tests/.local-only に列挙したテスト（tests/ からの相対パス、1行1件。
+# 例：test_local_debug.py、sub/test_x.py）はローカル専用として
+# UNPUBLISHED 対象外にする（同・確認への答え：環境固有の事情で公開
+# しないテストの逃がし方。ファイル自体は *.py ではないので照合対象に
+# は入らない）。書きかけのテストの構文エラーは本番ファイルと同じ重さ
+# で止める（同・確認への答え：テストも公開物のため、壊れたまま同期は
+# しない。1件の失敗で他のずれが見えなくなることはない：全ファイル分
+# の問題を集めてから警告する）。
 # ファイル名の対応: 公開用の slack-listener.service は稼働中の
 # slack-listener.service に対応する（scrub で名前が変わるため）。
 # このスクリプト自身も公開用コピーにあるので照合対象に入る。Yamaさんの
@@ -111,6 +123,13 @@ check_one() {
   esac
 }
 
+# tests/.local-only に列挙されたテスト（tests/ からの相対パス）は
+# ローカル専用として UNPUBLISHED 対象外にする。
+is_local_only_test() {
+  local rel="$1" list="$LIVE_DIR/tests/.local-only"
+  [ -f "$list" ] && grep -Fxq -- "$rel" "$list"
+}
+
 if [ ! -f "$SCRUB_SED" ]; then
   failures+=("SCRUB-MISSING: $SCRUB_SED （scrub.sed が無いので比較できない）")
   PROBLEMS=$((PROBLEMS + 1))
@@ -119,11 +138,13 @@ else
     rel="${f#"$PUBLIC_DIR"/}"
     check_one "$rel"
   done < <(find "$PUBLIC_DIR" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.service' -o -name '*.timer' \) -print0 2>/dev/null)
-  # tests/ も同じ形で照合する（scrub 比較＋py_compile）。
+  # tests/ も同じ形で照合する（scrub 比較＋py_compile）。サブディレクトリ
+  # も含めて再帰で見る（maxdepth 1 だと将来のサブディレクトリのテストで
+  # 同じ見逃しが起きる）。
   while IFS= read -r -d '' f; do
     rel="${f#"$PUBLIC_DIR"/}"
     check_one "$rel"
-  done < <(find "$PUBLIC_DIR/tests" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null)
+  done < <(find "$PUBLIC_DIR/tests" -type f -name '*.py' -print0 2>/dev/null)
   # 稼働中にだけある公開対象ファイル（同期忘れ）を検出する。
   while IFS= read -r -d '' f; do
     name="${f#"$LIVE_DIR"/}"
@@ -134,13 +155,15 @@ else
     fi
   done < <(find "$LIVE_DIR" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.service' -o -name '*.timer' \) -print0 2>/dev/null)
   # tests/ にだけあるテストも UNPUBLISHED で拾う（.bak は対象外）。
+  # tests/.local-only に列挙されたローカル専用テストは除く。
   while IFS= read -r -d '' f; do
     name="${f#"$LIVE_DIR"/}"
+    if is_local_only_test "${name#tests/}"; then continue; fi
     if [ ! -e "$PUBLIC_DIR/$(public_name "$name")" ]; then
       failures+=("UNPUBLISHED: $f （稼働中にだけある。公開用コピーへ同期すること）")
       PROBLEMS=$((PROBLEMS + 1))
     fi
-  done < <(find "$LIVE_DIR/tests" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null)
+  done < <(find "$LIVE_DIR/tests" -type f -name '*.py' -print0 2>/dev/null)
 fi
 
 if [ "$PROBLEMS" -eq 0 ]; then

@@ -350,13 +350,20 @@ def join_channel(channel_id, runner=subprocess.run):
 
 
 def greet(channel_id, runner=subprocess.run):
-    """One greeting parent post via channel_send_once.py (deduped)."""
+    """One greeting parent post via channel_send_once.py (deduped).
+
+    Returns True only when a greeting actually went out in this run.
+    channel_send_once.py exits 0 for both "sent" and "already-sent"
+    (an idempotent no-op), so a bare returncode check records
+    greeted=true for a 2nd+ greeting that was never sent (Claude Code
+    audit 2026-11-21); the already-sent stdout line is the tell.
+    """
     proc = runner(
         [sys.executable, os.path.join(BASE, "channel_send_once.py"),
          "--channel", channel_id, "--message", GREETING],
         capture_output=True, text=True, timeout=120, env=subprocess_env(),
         cwd=BASE)
-    return proc.returncode == 0
+    return proc.returncode == 0 and "already-sent" not in (proc.stdout or "")
 
 
 def backfill_channel(channel_id, runner=subprocess.run):

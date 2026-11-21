@@ -106,6 +106,21 @@ check("backfill_channel returns a marker dict on unparsable output",
           runner=fake_runner_factory(stdout="no json here")).get(
               "errors") == ["unparsable"])
 
+# greet: True only when a greeting actually went out in this run.
+# channel_send_once.py exits 0 for both "sent" and "already-sent",
+# so a bare returncode check records greeted=true for a 2nd+
+# greeting that was never sent (Claude Code audit 2026-11-21).
+check("greet is True when the greeting was sent",
+      aj.greet("C0EXAMPLE101",
+               runner=fake_runner_factory(stdout="sent 1795000000.1\n")) is True)
+check("greet is False when the greeting was already sent",
+      aj.greet("C0EXAMPLE101",
+               runner=fake_runner_factory(
+                   stdout="already-sent (1795000000.1)\n")) is False)
+check("greet is False on a nonzero exit",
+      aj.greet("C0EXAMPLE101",
+               runner=fake_runner_factory(returncode=2, stdout="")) is False)
+
 # Removed-channel guard (adopted 2026-11-18 from Yama's auto-join
 # share): a channel the bot was removed from is never auto-rejoined,
 # and a manual re-invite clears the record.

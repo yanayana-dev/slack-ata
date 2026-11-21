@@ -356,6 +356,46 @@ def thread_all_messages(channel, thread_ts):
     return messages
 
 
+def _find_sent_reply(messages, meta_replies, wanted, used_reply_ts,
+                     target_ts):
+    """Already-sent reply in the thread (original/prefixed text, after target).
+
+    meta_replies (event_id entries) already holds only our own
+    metadata-filtered replies; otherwise the search is over our own
+    messages in the thread. Pure search over already-fetched lists;
+    the caller owns the reads (and their failures), so the same check
+    can run twice: once after the sweep's read and once just before
+    the send, under the send lock (Claude Code audit 2026-11-21).
+    """
+    if meta_replies is not None:
+        return next((m for m in meta_replies
+                     if _normalize_text(m.get("text")) in wanted
+                     and m.get("ts") not in used_reply_ts
+                     and _is_reply_after_event(m.get("ts"), target_ts)),
+                    None)
+    return next((m for m in messages
+                 if m.get("user") == YANAYANA_USER
+                 and _normalize_text(m.get("text")) in wanted
+                 and m.get("ts") not in used_reply_ts
+                 and _is_reply_after_event(m.get("ts"), target_ts)), None)
+
+
+def _record_found_reply(e, found, used_reply_ts, summary):
+    """Record an already-sent reply found in the thread as delivered."""
+    used_reply_ts.add(found.get("ts"))
+    ro.record_reply(e.get("channel"), e.get("thread_ts"),
+                    e.get("target_ts"), found.get("ts"), recovered=True,
+                    event_id=e.get("event_id"))
+    append_pending_resend({**e, "status": "sent", "recovered": True,
+                           "reply_ts": found.get("ts"),
+                           "at": datetime.now(timezone.utc).isoformat()})
+    summary["sent"] += 1
+    summary["details"].append({"target_ts": e.get("target_ts"),
+                               "result": "sent",
+                               "reply_ts": found.get("ts"),
+                               "recovered": True})
+
+
 def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
                               metadata_reader=None):
     """One sweep over held pre-check-failure replies.
@@ -391,14 +431,38 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
         message = e.get("message")
         questioner = e.get("questioner_user")
         first_failed_at = e.get("first_failed_at") or e.get("at")
+        # 24h window from the original failure, no grace. Computed
+        # here so it also bounds the read-failure paths below: an
+        # entry whose thread can never be read must still expire
+        # (Claude Code audit 2026-11-21 -- "readable-again" was the
+        # only expiring path before).
         try:
-            messages = reader(channel, thread_ts)
-        except Exception as exc:
+            failed_epoch = datetime.fromisoformat(first_failed_at).timestamp()
+        except Exception:
+            failed_epoch = now_epoch
+
+        def _expire_or_skip(exc):
+            """Give up on window expiry, else leave pending. True if given up."""
+            if now_epoch - failed_epoch > RESEND_WINDOW_SECS:
+                append_pending_resend({**e, "status": "given_up",
+                                       "reason": "window_expired",
+                                       "at": datetime.now(timezone.utc).isoformat()})
+                summary["given_up"] += 1
+                summary["details"].append({"target_ts": target_ts,
+                                           "result": "given_up",
+                                           "reason": "window_expired"})
+                return True
             summary["skipped_read_failed"] += 1
             summary["still_pending"] += 1
             summary["details"].append(
                 {"target_ts": target_ts, "result": "skipped_read_failed",
                  "error": str(exc)[:200]})
+            return False
+
+        try:
+            messages = reader(channel, thread_ts)
+        except Exception as exc:
+            _expire_or_skip(exc)
             continue
         # Parent post deleted -> record only, never resend.
         if not any(m.get("ts") == thread_ts for m in messages):
@@ -437,34 +501,14 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
                 meta_replies = meta_reader(channel, thread_ts,
                                            e["event_id"])
             except Exception as exc:
-                summary["skipped_read_failed"] += 1
-                summary["still_pending"] += 1
-                summary["details"].append(
-                    {"target_ts": target_ts, "result": "skipped_read_failed",
-                     "error": str(exc)[:200]})
+                _expire_or_skip(exc)
                 continue
-            found = next((m for m in meta_replies
-                          if _normalize_text(m.get("text")) in wanted
-                          and m.get("ts") not in used_reply_ts
-                          and _is_reply_after_event(m.get("ts"), target_ts)), None)
         else:
-            found = next((m for m in messages
-                          if m.get("user") == YANAYANA_USER
-                          and _normalize_text(m.get("text")) in wanted
-                          and m.get("ts") not in used_reply_ts
-                          and _is_reply_after_event(m.get("ts"), target_ts)), None)
+            meta_replies = None
+        found = _find_sent_reply(messages, meta_replies, wanted,
+                                 used_reply_ts, target_ts)
         if found:
-            used_reply_ts.add(found.get("ts"))
-            ro.record_reply(channel, thread_ts, target_ts,
-                            found.get("ts"), recovered=True,
-                            event_id=e.get("event_id"))
-            append_pending_resend({**e, "status": "sent", "recovered": True,
-                                   "reply_ts": found.get("ts"),
-                                   "at": datetime.now(timezone.utc).isoformat()})
-            summary["sent"] += 1
-            summary["details"].append({"target_ts": target_ts, "result": "sent",
-                                       "reply_ts": found.get("ts"),
-                                       "recovered": True})
+            _record_found_reply(e, found, used_reply_ts, summary)
             continue
         # Someone else already answered: a text post after the target,
         # by anyone other than the questioner and Yanayana herself,
@@ -491,11 +535,8 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
                                        "reason": "answered_by_other",
                                        "answered_by_ts": answered_by.get("ts")})
             continue
-        # 24h window from the original failure, no grace.
-        try:
-            failed_epoch = datetime.fromisoformat(first_failed_at).timestamp()
-        except Exception:
-            failed_epoch = now_epoch
+        # 24h window from the original failure, no grace (failed_epoch
+        # computed at the top of this iteration).
         if now_epoch - failed_epoch > RESEND_WINDOW_SECS:
             append_pending_resend({**e, "status": "given_up",
                                    "reason": "window_expired",
@@ -504,26 +545,57 @@ def reconcile_pending_resends(thread_reader=None, sender=None, now=None,
             summary["details"].append({"target_ts": target_ts, "result": "given_up",
                                        "reason": "window_expired"})
             continue
-        try:
-            reply_ts = send(channel, thread_ts, prefixed)
-        except Exception as exc:
-            # A send failure here leaves the entry pending for the next
-            # hourly pass (until the 24h window expires); the sweep
-            # never guesses delivery and never reposts blindly.
-            summary["still_pending"] += 1
-            summary["details"].append({"target_ts": target_ts,
-                                       "result": "still_pending",
-                                       "error": str(exc)[:200]})
-            continue
-        if reply_ts:
-            used_reply_ts.add(reply_ts)
-            ro.record_reply(channel, thread_ts, target_ts, reply_ts,
-                            event_id=e.get("event_id"))
-        append_pending_resend({**e, "status": "sent", "reply_ts": reply_ts,
-                               "at": datetime.now(timezone.utc).isoformat()})
-        summary["sent"] += 1
-        summary["details"].append({"target_ts": target_ts, "result": "sent",
-                                   "reply_ts": reply_ts})
+        # Send under the same send.lock the hook path holds
+        # (send_reply_locked.py), with a fresh already-sent re-check
+        # first (Claude Code audit 2026-11-21): a reply may have
+        # landed between this sweep's thread read above and the send
+        # -- without the lock and the re-check, a hook worker sending
+        # to the same target in that window double-posts. A re-check
+        # read failure leaves the entry pending; the sweep never
+        # sends blind. The lock is released when the file closes,
+        # even on crash, so no stale lock can strand later sends.
+        os.makedirs(EVENTS, exist_ok=True)
+        with open(os.path.join(EVENTS, "send.lock"), "a+",
+                  encoding="utf-8") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                fresh = reader(channel, thread_ts)
+                fresh_meta = None
+                if e.get("event_id"):
+                    fresh_meta = meta_reader(channel, thread_ts,
+                                             e["event_id"])
+            except Exception as exc:
+                summary["skipped_read_failed"] += 1
+                summary["still_pending"] += 1
+                summary["details"].append(
+                    {"target_ts": target_ts, "result": "skipped_read_failed",
+                     "error": str(exc)[:200]})
+                continue
+            found = _find_sent_reply(fresh, fresh_meta, wanted,
+                                     used_reply_ts, target_ts)
+            if found:
+                _record_found_reply(e, found, used_reply_ts, summary)
+                continue
+            try:
+                reply_ts = send(channel, thread_ts, prefixed)
+            except Exception as exc:
+                # A send failure here leaves the entry pending for the next
+                # hourly pass (until the 24h window expires); the sweep
+                # never guesses delivery and never reposts blindly.
+                summary["still_pending"] += 1
+                summary["details"].append({"target_ts": target_ts,
+                                           "result": "still_pending",
+                                           "error": str(exc)[:200]})
+                continue
+            if reply_ts:
+                used_reply_ts.add(reply_ts)
+                ro.record_reply(channel, thread_ts, target_ts, reply_ts,
+                                event_id=e.get("event_id"))
+            append_pending_resend({**e, "status": "sent", "reply_ts": reply_ts,
+                                   "at": datetime.now(timezone.utc).isoformat()})
+            summary["sent"] += 1
+            summary["details"].append({"target_ts": target_ts, "result": "sent",
+                                       "reply_ts": reply_ts})
     return summary
 
 

@@ -340,7 +340,7 @@ stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "
 if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
   if [ ! -f "$STALL_FLAG" ]; then
     stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
-    if "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
+    if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
       mkdir -p "$(dirname "$STALL_FLAG")"
       touch "$STALL_FLAG"
     fi
@@ -370,7 +370,7 @@ for unit in slack-sync-check.service slack-auto-join.service; do
   if systemctl is-failed --quiet "$unit" 2>/dev/null; then
     if [ ! -f "$unit_flag" ]; then
       unit_msg="【ユニットの失敗】${unit} が failed 状態です。${role}が動いていません。確認してください。"
-      if "$BASE/bin/slackcli" messages send --recipient-id "$UNIT_FAIL_CHANNEL" --message "$unit_msg" --json >/dev/null 2>&1; then
+      if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$UNIT_FAIL_CHANNEL" --message "$unit_msg" --json >/dev/null 2>&1; then
         mkdir -p "$(dirname "$unit_flag")"
         touch "$unit_flag"
       fi

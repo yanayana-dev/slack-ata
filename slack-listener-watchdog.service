@@ -4,4 +4,10 @@ Description=Watchdog check for slack-listener
 [Service]
 Type=oneshot
 EnvironmentFile=/path/to/slack-watcher/proxy.env
+Environment=HOME=/path/to
+# slackcli is a Bun binary: without NODE_USE_ENV_PROXY it ignores the
+# proxy env vars, tries a direct TLS connection and hangs; and without
+# HOME it looks for its profile under /root/.config/slackcli and finds
+# none, so watchdog warnings never arrive (Claude Code audit 2026-11-21).
+Environment=NODE_USE_ENV_PROXY=1
 ExecStart=/usr/bin/env bash /path/to/slack-watcher/watchdog.sh

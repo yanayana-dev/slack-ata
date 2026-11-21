@@ -46,6 +46,10 @@ gap-time thread reply is recovered too. Thread re-reads pass
 neiro-slack-system 6980acd): without it a thread with more than 100
 replies returns only one page and newer replies past the page can be
 dropped; with the floor, only replies newer than the floor come back.
+Channel history itself is paged (MAX_HISTORY_PAGES, Neiro's 2026-11-21
+proposal): without paging, a long outage with more than --limit posts
+past the cutoff strands the middle ones, because the newest page
+advances max_ts past them.
 """
 import json
 import os
@@ -63,6 +67,16 @@ INBOX = os.path.join(EVENTS, "inbox.jsonl")
 SEEN_PATH = os.path.join(EVENTS, "seen_event_ids.json")
 SEEN_MAX = 1000
 SLACKCLI = os.path.join(BASE, "bin", "slackcli")
+
+# History is read in pages (Neiro's 2026-11-21 proposal, adopted the
+# same day): a single conversations read returns only --limit messages,
+# so a long outage with more than that many posts past the cutoff
+# would strand the middle ones forever (max_ts advances past them on
+# the newest page). Pages walk backwards with --latest set to the
+# oldest ts of the previous page (--latest is inclusive, so the
+# boundary message repeats; admit() dedupes it by seen key). The cap
+# bounds the read; hitting it is reported, never silent.
+MAX_HISTORY_PAGES = 3
 
 # Channels the bot has joined (see README.md).
 CHANNELS = [
@@ -102,6 +116,45 @@ def run_slackcli(args, timeout=60):
     if i < 0:
         raise RuntimeError(f"slackcli {' '.join(args)}: no JSON in output")
     return json.loads(text[i:])
+
+
+def read_history_pages(channel, limit, floor):
+    """Read a channel's history across pages, newest pages first.
+
+    Returns (messages, capped): messages is every message read, oldest
+    first within each page, pages in newest-to-oldest order; capped is
+    True when MAX_HISTORY_PAGES ran out while has_more was still set,
+    i.e. older messages may remain unread. Stops early when a page has
+    no more, or its newest message is at or below the floor (older
+    pages can only be older, so nothing past the floor is missed).
+    Raises on a slackcli failure so the caller can record the error.
+    """
+    messages = []
+    latest = None
+    capped = False
+    for _ in range(MAX_HISTORY_PAGES):
+        args = ["conversations", "read", channel,
+                "--limit", limit, "--json"]
+        if latest is not None:
+            args += ["--latest", latest]
+        data = run_slackcli(args)
+        page = data.get("messages") or []
+        if not page:
+            break
+        messages.extend(page)
+        if not data.get("has_more"):
+            break
+        try:
+            if float(page[-1].get("ts")) <= floor:
+                break
+        except (TypeError, ValueError):
+            break
+        latest = page[0].get("ts")
+        if latest is None:
+            break
+    else:
+        capped = True
+    return messages, capped
 
 
 def load_seen():
@@ -271,14 +324,16 @@ def main():
 
     for channel in channels:
         try:
-            data = run_slackcli(
-                ["conversations", "read", channel,
-                 "--limit", limit, "--json"])
+            messages, capped = read_history_pages(channel, limit, floor)
         except Exception as e:
             errors.append(f"{channel}: {e}")
             continue
+        if capped:
+            errors.append(
+                f"{channel}: history page cap ({MAX_HISTORY_PAGES} pages) "
+                "reached; older messages past the cutoff may be missed")
         threads = []
-        for msg in data.get("messages") or []:
+        for msg in messages:
             admit(channel, msg)
             if msg.get("reply_count"):
                 threads.append(msg["ts"])

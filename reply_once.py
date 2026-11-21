@@ -119,6 +119,7 @@ own earlier reply in the same thread (local-ledger parroting guard,
 added 2026-11-14 from Yama's proposal); nothing was sent.
 """
 import fcntl
+import html
 import json
 import os
 import subprocess
@@ -379,15 +380,18 @@ def duplicate_of_other(channel, thread_ts, message, since_ts=None):
 
 
 def normalize_text(text):
-    """Whitespace-normalized form for ledger comparison.
+    """Whitespace- and escaping-normalized form for ledger comparison.
 
     All runs of whitespace (spaces, newlines, tabs) collapse to a
     single space, and the ends are stripped, so a draft that only
     re-wraps an earlier reply still matches it. Yama's proposal
     (2026-11-14): start from exact match after normalizing blank
-    space and line breaks.
+    space and line breaks. HTML entities are unescaped first
+    (Claude Code audit 2026-11-21): Slack returns `&amp;` etc. in
+    message text, so without this a delivered reply containing `&`
+    never matches the ledger draft.
     """
-    return " ".join((text or "").split())
+    return " ".join(html.unescape(text or "").split())
 
 
 def duplicate_of_own_ledger(thread_ts, message):
@@ -737,7 +741,11 @@ def already_replied(channel, thread_ts, target_ts=None, message=None,
             # Other replies in the thread answer other messages and do
             # not block this one; only the exact same text (what a
             # crash-and-retry would resend) counts as a duplicate.
-            if message and message in texts:
+            # Compared normalized (see normalize_text): Slack escapes
+            # `&` etc. in returned text, so a raw exact match misses
+            # a delivered reply (Claude Code audit 2026-11-21).
+            if message and any(normalize_text(t) == normalize_text(message)
+                               for t in texts):
                 return "thread"
         elif texts:
             return "thread"

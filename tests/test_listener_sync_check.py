@@ -250,6 +250,43 @@ def main():
           and "test_example.py.bak" not in r.stdout)
     e.cleanup()
 
+    # 15. tests/ のサブディレクトリも再帰で照合する（Neiroさんの
+    # 2026-11-21 の確認2：maxdepth 1 だと将来のサブディレクトリの
+    # テストで同じ見逃しが起きる）
+    e = Env()
+    e.write_both("tests/sub/test_nested.py", "print('new')\n",
+                 live_content="print('old')\n")
+    r = e.run()
+    check("tests subdir drift detected", r.returncode == 1
+          and "DRIFT" in r.stdout
+          and "tests/sub/test_nested.py" in r.stdout)
+    e.cleanup()
+
+    # 16. 稼働中にだけあるサブディレクトリのテストも UNPUBLISHED で拾う
+    e = Env()
+    e.write_both("tests/test_example.py", "print('ok')\n")
+    e.write_live("tests/sub/test_brand_new.py", "print('not synced yet')\n")
+    r = e.run()
+    check("unpublished subdir test flagged", r.returncode == 1
+          and "UNPUBLISHED" in r.stdout
+          and "tests/sub/test_brand_new.py" in r.stdout)
+    e.cleanup()
+
+    # 17. tests/.local-only に列挙したテストはローカル専用として
+    # UNPUBLISHED 対象外（Neiroさんの 2026-11-21 の確認1：環境固有の
+    # 事情で公開しないテストの逃がし方）
+    e = Env()
+    e.write_both("tests/test_example.py", "print('ok')\n")
+    e.write_live("tests/test_local_debug.py", "print('local only')\n")
+    e.write_live("tests/sub/test_local_sub.py", "print('local only')\n")
+    e.write_live("tests/.local-only",
+                 "# local-only tests, one relative path per line\n"
+                 "test_local_debug.py\nsub/test_local_sub.py\n")
+    r = e.run()
+    check("local-only tests ignored", r.returncode == 0
+          and "listener sync: ok" in r.stdout)
+    e.cleanup()
+
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")
     sys.exit(0 if CHECKS[1] == 0 else 1)
 

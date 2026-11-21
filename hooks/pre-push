@@ -47,7 +47,21 @@ while read local_ref local_sha remote_ref remote_sha; do
   fi
 
   # 2 + 3. diff content scan (added lines only)
-  diff=$(git diff $range 2>/dev/null | grep '^+' | grep -v '^+++' || true)
+  # Per-commit, not one net diff (Claude Code audit 2026-11-21):
+  # `git diff $range` is empty for a first push to a new repo --
+  # the range there is "$local_sha --not --remotes", and `git diff`
+  # with a single commit argument diffs the work tree against it,
+  # so a clean tree yields nothing and the scan misses everything
+  # (the delete -> recreate -> re-push path that once leaked a real
+  # email). A net diff also hides a secret added in one commit and
+  # removed in a later commit of the same push. So scan every
+  # commit's own diff instead; `git rev-list` accepts both range
+  # forms. Email check above already uses git log per commit.
+  diff=""
+  for commit in $(git rev-list $range 2>/dev/null || true); do
+    diff="$diff
+$(git show --format= --no-color $commit 2>/dev/null | grep '^+' | grep -v '^+++' || true)"
+  done
   if [ -n "$diff" ]; then
     # Dummy placeholders (e.g. xoxb-REPLACE-ME in config.example.json)
     # must not trip the gate: Yama's share (2026-11-14) showed a gate
