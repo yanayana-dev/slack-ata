@@ -34,6 +34,13 @@ SRC=$BASE/slack-listener.service
 DST=$DST_DIR/slack-listener.service
 HB=$BASE/events/heartbeat.json
 STATE_FILE=${WATCHDOG_STATE_FILE:-$BASE/events/watchdog_reinstall.state}
+# Shared restart-cooldown stamp, used by both the post-reinstall
+# restart below and the heartbeat-stall restart further down: any
+# watchdog run (timer, hook self-heal, recovery cron) that restarts
+# the listener stamps it, so an overlapping run does not restart
+# the just-started listener again while its first heartbeat (the
+# listener writes one every 15s) is still pending.
+COOLDOWN_FILE=${WATCHDOG_RESTART_COOLDOWN_FILE:-$BASE/events/watchdog_restart.cooldown}
 MAX_ATTEMPTS=3
 BACKOFF_BASE=30
 
@@ -258,7 +265,17 @@ fi
 # let the next run verify health instead of restarting twice.
 if [ "$listener_reinstalled" = 1 ]; then
   if listener_py_ok; then
-    systemctl restart "$UNIT" >/dev/null 2>&1
+    if systemctl restart "$UNIT" >/dev/null 2>&1; then
+      # Stamp the restart cooldown (same file the heartbeat path
+      # uses): a second watchdog run overlapping this one -- the
+      # timer, the hook self-heal, or the recovery cron -- must not
+      # restart the just-started listener again while its first
+      # heartbeat (15s cadence) is still pending. Found 2026-11-22:
+      # after a VM replacement the listener was restarted twice
+      # within 5s (22:38:44 and 22:38:49 UTC) because the reinstall
+      # path never stamped the cooldown.
+      echo "$(date +%s)" > "$COOLDOWN_FILE"
+    fi
     exit 0
   else
     echo "watchdog: listener.py does not compile; skipping restart after reinstall" >&2
@@ -307,7 +324,8 @@ if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
     # this mainly guards back-to-back or manual runs and the hook's
     # self-heal call. The stamp is written only when the restart
     # itself succeeded; a failed restart stays retryable.
-    COOLDOWN_FILE=${WATCHDOG_RESTART_COOLDOWN_FILE:-$BASE/events/watchdog_restart.cooldown}
+    # (COOLDOWN_FILE is defined near the top of the script and is
+    # also stamped by the post-reinstall restart above.)
     last_restart=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
     case "$last_restart" in ''|*[!0-9]*) last_restart=0 ;; esac
     if [ $(( now - last_restart )) -ge 60 ]; then

@@ -285,6 +285,32 @@ def main():
           r.returncode == 0 and e.restarts() == 1)
     e.cleanup()
 
+    # 11. 再インストール後の再起動でもクールダウンファイルが刻印される
+    # （2026-11-22: VM入れ替え後、再インストール経路が刻印せず
+    # 22:38:44 と 22:38:49 の5秒で2回再起動された）。
+    e = Env()
+    e.set_heartbeat(connected=True, age=300)
+    e.differ_unit()
+    r = e.run_watchdog()
+    stamped = os.path.exists(e.cooldown_path())
+    fresh_stamp = False
+    if stamped:
+        with open(e.cooldown_path(), encoding="utf-8") as f:
+            try:
+                fresh_stamp = int(time.time()) - int(f.read()) < 60
+            except ValueError:
+                fresh_stamp = False
+    check("reinstall restart stamps the cooldown",
+          r.returncode == 0 and e.restarts() == 1
+          and stamped and fresh_stamp)
+    # 12. その直後に重なった2回目の実行は、heartbeat がまだ古くても
+    # 再起動しない（起動直後の初回 heartbeat は15秒後なので、5秒の
+    # 再確認だけでは古いまま見える）。
+    r = e.run_watchdog()
+    check("overlapping run after reinstall does not re-restart",
+          r.returncode == 0 and e.restarts() == 1)
+    e.cleanup()
+
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")
     sys.exit(0 if CHECKS[1] == 0 else 1)
 
