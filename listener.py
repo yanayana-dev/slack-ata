@@ -11,6 +11,7 @@ They are never printed, logged, or written to the inbox file.
 """
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -187,14 +188,31 @@ def main():
 
     # Identify this bot so its own posts never enter the inbox
     # (prevents the agent from reacting to itself / bot loops).
+    # auth.test result is shape-checked ([UW]0... / B0... fullmatch, the
+    # same rule Neiro's reconcile uses): a garbage user_id must never be
+    # adopted as our own identity, and a failed auth.test is fail-closed
+    # after retries instead of silently continuing unidentified.
     own_user_id = None
     own_bot_id = None
-    try:
-        me = web_client.auth_test()
-        own_user_id = me.get("user_id")
-        own_bot_id = me.get("bot_id")
-    except Exception as e:
-        print(f"auth_test failed: {e}", file=sys.stderr, flush=True)
+    me = None
+    for attempt in range(3):
+        try:
+            me = web_client.auth_test()
+            break
+        except Exception as e:
+            print(f"auth_test failed (attempt {attempt + 1}/3): {e}", file=sys.stderr, flush=True)
+            time.sleep(2)
+    if me is None:
+        print("auth_test failed after retries; cannot identify self, exiting", file=sys.stderr, flush=True)
+        sys.exit(1)
+    own_user_id = me.get("user_id")
+    own_bot_id = me.get("bot_id")
+    if not own_user_id or not re.fullmatch(r"[UW]0[A-Z0-9]{8,}", own_user_id):
+        print(f"auth_test returned invalid user_id: {own_user_id!r}; exiting", file=sys.stderr, flush=True)
+        sys.exit(1)
+    if own_bot_id and not re.fullmatch(r"B0[A-Z0-9]{8,}", own_bot_id):
+        print(f"auth_test returned invalid bot_id: {own_bot_id!r}; exiting", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     # SKIP_SUBTYPES is module-level: the user-DM path skips the same
     # subtypes as the main path.
