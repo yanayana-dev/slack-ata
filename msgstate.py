@@ -75,15 +75,42 @@ MAX_ATTEMPTS = 3
 # is presumed crashed; the poller reclaims it on the next poll.
 TIMEOUT_SECS = 600
 # Per-wake batch cap (burst fix, 2026-11-21): `pending` hands a worker
-# at most this many messages, oldest first. The uncapped list made one
-# wake try to chew a whole burst of long posts in a single agent run;
-# when that run died or was cut off, its claims sat in processing
-# until the 600s sweep, burned attempts, and eventually dead-lettered
-# (the 2026-11-12 / 2026-11-18 dead letters all have this shape).
-# Leftovers stay pending and re-wake on the next 30s poll, so a burst
-# drains over several bounded runs instead of one monster run.
-# count-pending / oldest-pending-age always see the full backlog.
+# at most this many messages, in priority order (see _priority_tier).
+# The uncapped list made one wake try to chew a whole burst of long
+# posts in a single agent run; when that run died or was cut off, its
+# claims sat in processing until the 600s sweep, burned attempts, and
+# eventually dead-lettered (the 2026-11-12 / 2026-11-18 dead letters
+# all have this shape). Leftovers stay pending and re-wake on the next
+# 30s poll, so a burst drains over several bounded runs instead of one
+# monster run. count-pending / oldest-pending-age always see the full
+# backlog.
 DEFAULT_PENDING_LIMIT = 3
+
+# Priority tiers for the per-wake batch (Neiro's burst fix, shared
+# 2026-11-21 in #slack-へようこそ): a burst must not starve the
+# messages that need a fast reply -- DM first, then messages addressed
+# to Yanayana or to あた, then everything else. Oldest first inside
+# each tier (stable sort over inbox order), so no tier starves
+# forever; the watchdog's oldest-pending-age still watches the
+# backlog as a whole. IDs are scrubbed to placeholders on publish
+# (see scrub.sed). Down-tier starvation under a sustained flood
+# (aging) is a known open point, same as on Neiro's side.
+DM_CHANNEL_TYPES = ("im", "mpim")
+YANAYANA_USER_ID = "U0EXAMPLEBOT"
+ATA_USER_ID = "U0EXAMPLEOWNER"
+
+
+def _priority_tier(rec):
+    """0 = DM, 1 = addressed to Yanayana/あた, 2 = everything else."""
+    if rec.get("channel_type") in DM_CHANNEL_TYPES:
+        return 0
+    text = rec.get("text") or ""
+    lowered = text.lower()
+    if ("やなやな" in lowered or "yanayana" in lowered
+            or f"<@{YANAYANA_USER_ID}>" in text
+            or f"<@{ATA_USER_ID}>" in text):
+        return 1
+    return 2
 
 
 @contextmanager
@@ -226,9 +253,12 @@ def pending_items(state=None, limit=None):
             "attempts": max(s.get("attempts", 0) for _, s in sts),
             "message": rec,
         })
+    # Priority order (stable: oldest first inside each tier). The cap
+    # below keeps the first N of that order; the deferred rest re-wake
+    # on the next poll. --all also returns priority order so every
+    # consumer sees the same sequence.
+    items.sort(key=lambda it: _priority_tier(it["message"]))
     if limit is not None:
-        # Items are built in inbox order (oldest first), so the cap
-        # keeps the oldest work and defers the rest to the next wake.
         items = items[:limit]
     return items
 

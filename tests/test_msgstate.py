@@ -352,6 +352,46 @@ def main():
     check("不在キーへのtouchは状態を作らない",
           "EvNope" not in state(base14))
 
+    # 14. 優先順位 (2026-11-21, Neiroさんのバースト対策の取り込み)。
+    # DM > Yanayana/あた宛て > その他、各ティア内は古い順。バースト時
+    # に宛てられた投稿が議論の後ろで待たされ続けないための順序で、
+    # 上限の枠はこの順序の先頭から埋まる。
+    def msg2(event_id, ts, text, channel_type="channel"):
+        m = msg(event_id, ts, text)
+        m["channel_type"] = channel_type
+        return m
+
+    base15 = make_base([
+        msg2("EvP1", "1794478306.000031", "雑談です"),
+        msg2("EvP2", "1794478306.000032", "やなやな、教えて"),
+        msg2("EvP3", "1794478306.000033", "Neiroさんの共有です"),
+        msg2("EvP4", "1794478306.000034", "DMです", "im"),
+        msg2("EvP5", "1794478306.000035", "あた宛て <@U0EXAMPLEOWNER> どう思う？"),
+        msg2("EvP6", "1794478306.000036", "Hey Yanayana, one question"),
+    ])
+    items = pending(base15)
+    check("バースト時はDM・宛てられた投稿が上限枠に先に入る",
+          [it["key"] for it in items] == ["EvP4", "EvP2", "EvP5"],
+          f"got {[it['key'] for it in items]}")
+    check("--allはティア順・ティア内は古い順",
+          [it["key"] for it in pending_raw(base15, ["--all"])]
+          == ["EvP4", "EvP2", "EvP5", "EvP6", "EvP1", "EvP3"])
+    check("count-pendingは順序の影響を受けない",
+          count_pending(base15) == 6)
+    mark(base15, "EvP4", "done")
+    items = pending(base15)
+    check("DMがdoneになると次のティアが枠に入る",
+          [it["key"] for it in items] == ["EvP2", "EvP5", "EvP6"])
+
+    base16 = make_base([
+        msg2("EvQ1", "1794478306.000041", "雑談です"),
+        msg2("EvQ2", "1794478306.000042", "確認です <@U0EXAMPLEBOT>"),
+    ])
+    items = pending(base16)
+    check("メンション <@Yanayana> も宛てられた扱い",
+          [it["key"] for it in items] == ["EvQ2", "EvQ1"],
+          f"got {[it['key'] for it in items]}")
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1
