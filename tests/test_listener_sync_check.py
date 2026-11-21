@@ -71,12 +71,17 @@ class Env:
         self.tmp.cleanup()
 
     def write_both(self, name, content, live_content=None):
+        for base in (self.pub, self.live):
+            os.makedirs(os.path.dirname(os.path.join(base, name)),
+                        exist_ok=True)
         with open(os.path.join(self.pub, name), "w", encoding="utf-8") as f:
             f.write(content)
         with open(os.path.join(self.live, name), "w", encoding="utf-8") as f:
             f.write(content if live_content is None else live_content)
 
     def write_live(self, name, content):
+        os.makedirs(os.path.dirname(os.path.join(self.live, name)),
+                    exist_ok=True)
         with open(os.path.join(self.live, name), "w", encoding="utf-8") as f:
             f.write(content)
 
@@ -214,6 +219,35 @@ def main():
     r = e.run(scrub=os.path.join(e.tmp.name, "no-such.sed"))
     check("missing scrub file reported", r.returncode == 1
           and "SCRUB-MISSING" in r.stdout)
+    e.cleanup()
+
+    # 12. tests/ が一致していれば ok（トップレベルと同じ形で照合される）
+    e = Env()
+    e.write_both("tests/test_example.py", "print('ok')\n")
+    r = e.run()
+    check("matching tests pass", r.returncode == 0
+          and "listener sync: ok" in r.stdout)
+    e.cleanup()
+
+    # 13. tests/ の1行のずれも DRIFT で検出する
+    e = Env()
+    e.write_both("tests/test_example.py", "print('new')\n",
+                 live_content="print('old')\n")
+    r = e.run()
+    check("tests drift detected", r.returncode == 1 and "DRIFT" in r.stdout
+          and "tests/test_example.py" in r.stdout and e.warns() == 1)
+    e.cleanup()
+
+    # 14. 稼働中にだけあるテストは UNPUBLISHED で拾う（.bak は対象外）
+    e = Env()
+    e.write_both("tests/test_example.py", "print('ok')\n")
+    e.write_live("tests/test_brand_new.py", "print('not synced yet')\n")
+    e.write_live("tests/test_example.py.bak", "print('backup')\n")
+    r = e.run()
+    check("unpublished test flagged, bak ignored", r.returncode == 1
+          and "UNPUBLISHED" in r.stdout
+          and "tests/test_brand_new.py" in r.stdout
+          and "test_example.py.bak" not in r.stdout)
     e.cleanup()
 
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")

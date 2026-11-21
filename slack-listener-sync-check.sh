@@ -12,13 +12,18 @@
 # scrub.sed をかけた一時コピーと公開用コピーを比べる。
 #
 # 検証するもの（対象は公開用コピーにあるトップレベルの *.py, *.sh,
-# *.service, *.timer。稼働中にだけある config.json / oauth_helper_server.py /
-# proxy.env / bin/ / events/ は対象外）:
+# *.service, *.timer と tests/*.py。稼働中にだけある config.json /
+# oauth_helper_server.py / proxy.env / bin/ / events/ は対象外）:
 #   1. 公開用コピーにあるファイルに対応する稼働中のファイルが存在すること
 #   2. scrub 後の内容が一致すること
 #   3. .py は両方とも py_compile を通り、.sh は両方とも bash -n を通ること
+#      （py_compile は scrub 後のテキストではなく元のファイルにかける。
+#      置換で構文が壊れる心配を避けるため。2026-11-21、Neiroさんの指摘）
 #   4. 稼働中にだけある公開対象ファイルが無いこと（同期忘れの検出。
 #      config.json 等の既知の稼働中専用ファイルは除く）
+# tests/ は 2026-11-21 に範囲へ追加した。以前はトップレベルのみで、
+# tests/ のずれ（例：2026-11-20 の curl rc=6 再現テスト）は見逃していた。
+# tests/ の .bak は対象外（拡張子が .py ではないため拾われない）。
 # ファイル名の対応: 公開用の slack-listener.service は稼働中の
 # slack-listener.service に対応する（scrub で名前が変わるため）。
 # このスクリプト自身も公開用コピーにあるので照合対象に入る。Yamaさんの
@@ -114,6 +119,11 @@ else
     rel="${f#"$PUBLIC_DIR"/}"
     check_one "$rel"
   done < <(find "$PUBLIC_DIR" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.service' -o -name '*.timer' \) -print0 2>/dev/null)
+  # tests/ も同じ形で照合する（scrub 比較＋py_compile）。
+  while IFS= read -r -d '' f; do
+    rel="${f#"$PUBLIC_DIR"/}"
+    check_one "$rel"
+  done < <(find "$PUBLIC_DIR/tests" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null)
   # 稼働中にだけある公開対象ファイル（同期忘れ）を検出する。
   while IFS= read -r -d '' f; do
     name="${f#"$LIVE_DIR"/}"
@@ -123,6 +133,14 @@ else
       PROBLEMS=$((PROBLEMS + 1))
     fi
   done < <(find "$LIVE_DIR" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.service' -o -name '*.timer' \) -print0 2>/dev/null)
+  # tests/ にだけあるテストも UNPUBLISHED で拾う（.bak は対象外）。
+  while IFS= read -r -d '' f; do
+    name="${f#"$LIVE_DIR"/}"
+    if [ ! -e "$PUBLIC_DIR/$(public_name "$name")" ]; then
+      failures+=("UNPUBLISHED: $f （稼働中にだけある。公開用コピーへ同期すること）")
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+  done < <(find "$LIVE_DIR/tests" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null)
 fi
 
 if [ "$PROBLEMS" -eq 0 ]; then
