@@ -264,10 +264,22 @@ def pending_items(state=None, limit=None):
 
 
 def _parse_ts(s):
+    """Parse an ISO timestamp; naive values are read as UTC.
+
+    Naive input used to crash the stale sweep with TypeError
+    (aware `now` minus naive `updated_at`) -- the same hole Neiro's
+    agy review found in their received_at handling (2026-11-21):
+    an external/legacy timestamp without a timezone must be read
+    as UTC, not left naive. All timestamps we write are aware UTC,
+    so this only matters for legacy or foreign input.
+    """
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except Exception:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def sweep_stale_locked(state, now=None):

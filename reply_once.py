@@ -160,10 +160,35 @@ def window_start(target_ts):
 
 
 def load_record():
+    """Read the reply ledger.
+
+    One corrupt line must not discard the whole ledger: bad lines
+    are skipped and good records stay. A file that cannot be read
+    at all raises (missing is fine -> []); callers treat that as
+    cannot-verify. Same lesson as Neiro's 中-1 (2026-11-21): an
+    exception while reading a dedupe ledger must not read as
+    "no duplicate" and let a send proceed.
+    """
     try:
         with open(REPLIED, "r", encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-    except Exception:
+            out = []
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    # 2026-11-21, Yama's question in #slack-へようこそ:
+                    # a skipped corrupt line used to vanish silently,
+                    # so ledger loss went unnoticed. Log the skip
+                    # (line number + truncated content) to stderr so
+                    # it shows in the run logs; good lines still load.
+                    print(f"load_record: skipping corrupt line {lineno} "
+                          f"in {REPLIED}: {line[:120]!r}", file=sys.stderr)
+                    continue
+            return out
+    except FileNotFoundError:
         return []
 
 
@@ -694,11 +719,18 @@ def stamped_texts(channel, thread_ts, event_id, since_ts=None):
 
 def already_replied(channel, thread_ts, target_ts=None, message=None,
                     event_id=None):
-    if target_ts:
-        if in_record_for_target(target_ts):
+    try:
+        if target_ts:
+            if in_record_for_target(target_ts):
+                return "record"
+        elif in_record(thread_ts):
             return "record"
-    elif in_record(thread_ts):
-        return "record"
+    except Exception as e:
+        # Ledger unreadable: cannot verify, refuse to send blind
+        # rather than risk a duplicate reply.
+        print(f"warning: record check failed ({e}); cannot verify",
+              file=sys.stderr)
+        return "unknown"
     if event_id:
         # Metadata first: a stamp proves this event was answered
         # even when the reply text differs from the draft (e.g. a
@@ -831,7 +863,16 @@ def main(argv):
         if target_ts:
             resolve_ambiguous(channel, thread_ts, target_ts,
                               event_id=event_id)
-            if found == "thread" and message and not in_record_for_target(target_ts):
+            try:
+                already_recorded = in_record_for_target(target_ts)
+            except Exception as e:
+                # Reply already proven by the thread; a ledger that
+                # cannot be read only skips the repair record, it
+                # must not crash the run after the proof.
+                print(f"warning: could not check ledger for thread-found "
+                      f"reply ({e}); skipping repair record", file=sys.stderr)
+                already_recorded = True
+            if found == "thread" and message and not already_recorded:
                 # Adopted 2026-11-12 from Yama's self-review proposal in
                 # #slack-へようこそ (their record-reply path): a reply
                 # proven by the thread but missing from the ledger is
@@ -861,7 +902,14 @@ def main(argv):
     # 2026-11-14 from Yama's confirmation (thread
     # 1794614134.265419): their ledger check is the mainline step
     # before the Slack history scan, not a fallback.
-    own_ts = duplicate_of_own_ledger(thread_ts, message)
+    try:
+        own_ts = duplicate_of_own_ledger(thread_ts, message)
+    except Exception as e:
+        # Same fail-closed stance as the already-replied check: when
+        # the ledger cannot be read, do not send blind.
+        print(f"cannot-verify: own-ledger check failed ({e}); "
+              "refusing to send", file=sys.stderr)
+        return 2
     if own_ts:
         print(f"duplicate-own-ledger: outgoing message repeats "
               f"Yanayana's own earlier reply in this thread "

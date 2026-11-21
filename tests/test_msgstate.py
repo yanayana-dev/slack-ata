@@ -392,6 +392,25 @@ def main():
           [it["key"] for it in items] == ["EvQ2", "EvQ1"],
           f"got {[it['key'] for it in items]}")
 
+    # 15. naive な updated_at は UTC として扱う (2026-11-21,
+    # Neiro さんの agy レビュー指摘と同型の穴)。_parse_ts が
+    # naive を返していた頃は、aware な now との引き算で
+    # TypeError になり、sweep ごと pending が死んでいた。
+    base17 = make_base([msg("EvNaive1", "1795270000.000001", "hello")])
+    mark(base17, "EvNaive1", "processing")
+    st = state(base17)
+    naive_old = (datetime.now() - timedelta(seconds=1200)).isoformat()
+    st["EvNaive1"]["updated_at"] = naive_old  # タイムゾーンなし
+    with open(os.path.join(base17, "events", "message_state.json"),
+              "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    items = pending(base17)  # sweep が TypeError で死なないこと
+    check("naive な updated_at でも sweep が死なない",
+          len(items) == 1 and items[0]["key"] == "EvNaive1",
+          f"got {items}")
+    check("naive な updated_at の stale は pending へ戻る",
+          items[0]["status"] == "pending" if items else False)
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1

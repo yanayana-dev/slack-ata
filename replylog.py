@@ -7,6 +7,16 @@ and cross-check the record before replying again.
 
 Usage:
   replylog.py check  --target-ts <ts>            # FOUND / NOT_FOUND
+                     # Exit 2 (cannot-verify) when the ledger cannot be
+                     # read at all -- never NOT_FOUND on error, so a
+                     # caller that sends unless FOUND cannot mistake a
+                     # broken check for "no duplicate" (fail-open).
+                     # Added 2026-11-21 from Neiro's 中-1 (send-once
+                     # fail-open): their duplicate-check Python piece
+                     # exits 1 (= "no duplicate") on exception and the
+                     # send proceeds; our check had the same shape --
+                     # load() raising gave a traceback and exit 1
+                     # with no FOUND/NOT_FOUND line.
   replylog.py record --channel <C> --target-ts <ts> --sent-ts <ts>
                      [--thread-ts <ts>]
   replylog.py prune [--older-than-days N] [--dry-run]
@@ -97,12 +107,20 @@ def load(path=None):
         return []
     out = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if line:
                 try:
                     out.append(json.loads(line))
                 except Exception:
+                    # 2026-11-21, Yama's question in #slack-へようこそ
+                    # (same point as for reply_once.load_record):
+                    # a skipped corrupt line used to vanish silently,
+                    # so ledger loss went unnoticed. Log the skip
+                    # (line number + truncated content) to stderr;
+                    # good lines still load.
+                    print(f"load: skipping corrupt line {lineno} "
+                          f"in {path}: {line[:120]!r}", file=sys.stderr)
                     continue
     return out
 
@@ -124,7 +142,18 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "check":
-        hit = next((x for x in load() if x.get("target_ts") == args.target_ts), None)
+        # Fail-closed (2026-11-21, Neiro's 中-1): a ledger that cannot
+        # be read is "cannot verify", not "no duplicate". An uncaught
+        # exception here used to end in a traceback with exit 1 and
+        # no FOUND/NOT_FOUND line, which a caller sending unless
+        # FOUND would read as "not replied" and send anyway.
+        try:
+            entries = load()
+        except Exception as e:
+            print(f"check-failed: cannot read reply ledger ({e}); "
+                  f"refusing to treat as NOT_FOUND", file=sys.stderr)
+            return 2
+        hit = next((x for x in entries if x.get("target_ts") == args.target_ts), None)
         if hit:
             print("FOUND " + json.dumps(hit, ensure_ascii=False))
         else:

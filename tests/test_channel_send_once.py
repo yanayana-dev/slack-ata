@@ -228,6 +228,54 @@ def test_duplicate_check_read_failure(tmp):
           read_jsonl(cso.POSTS) == [])
 
 
+def test_corrupt_line_kept(tmp):
+    """One corrupt ledger line must not discard the good records.
+
+    Same lesson as Neiro's 中-1 (2026-11-21): a bad line used to
+    kill the whole load_record() list, so a recorded post read as
+    "not sent" and could be posted twice.
+    """
+    setup(tmp, "corrupt_kept")
+    with open(cso.POSTS, "w", encoding="utf-8") as f:
+        f.write('{"channel": "C0TEST", "text": "' + MSG + '", "post_ts": "444.4",'
+                ' "recovered": false, "at": "2026-11-21T00:00:00+00:00"}\n')
+        f.write('this is not json\n')
+    sent = []
+    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    rc = cso.main(list(ARGS))
+    check("corrupt line + good record -> exit 0", rc == 0, f"rc={rc}")
+    check("corrupt line + good record -> no send attempted", sent == [])
+
+
+def test_non_utf8_ledger_cannot_verify(tmp):
+    """A ledger that cannot be decoded is cannot-verify, not
+    "not sent": main must refuse to send blind (exit 2)."""
+    setup(tmp, "non_utf8")
+    with open(cso.POSTS, "wb") as f:
+        f.write(b'{"channel": "C0TEST", "text": "x"}\n\xff\xfe bad bytes\n')
+    sent = []
+    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    rc = cso.main(list(ARGS))
+    check("non-UTF-8 ledger -> exit 2", rc == 2, f"rc={rc}")
+    check("non-UTF-8 ledger -> no send attempted", sent == [])
+    check("non-UTF-8 ledger -> no record written",
+          open(cso.POSTS, "rb").read() ==
+          b'{"channel": "C0TEST", "text": "x"}\n\xff\xfe bad bytes\n')
+
+
+def test_bad_line_does_not_block_new_send(tmp):
+    """A ledger holding only a corrupt line still lets a genuinely
+    new post go out: the bad line is skipped, not fatal."""
+    setup(tmp, "bad_line_only")
+    with open(cso.POSTS, "w", encoding="utf-8") as f:
+        f.write('not json at all\n')
+    rc = cso.main(list(ARGS))
+    recs = cso.load_record()  # tolerant read: the bad line stays, the new record lands
+    check("bad line only + new text -> exit 0", rc == 0, f"rc={rc}")
+    check("bad line only + new text -> record written",
+          len(recs) == 1 and recs[0].get("post_ts") == "444.4")
+
+
 def test_single_call_latest_50(tmp):
     """One read with --limit 50 is the whole bounded window.
 
@@ -287,6 +335,9 @@ def main():
         test_duplicate_of_other_blocks(tmp)
         test_duplicate_of_other_scope(tmp)
         test_duplicate_check_read_failure(tmp)
+        test_corrupt_line_kept(tmp)
+        test_non_utf8_ledger_cannot_verify(tmp)
+        test_bad_line_does_not_block_new_send(tmp)
         test_single_call_latest_50(tmp)
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 0 if CHECKS[1] == 0 else 1

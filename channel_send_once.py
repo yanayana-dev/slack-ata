@@ -158,10 +158,36 @@ def prune_record(path=None, days=DEFAULT_RETENTION_DAYS, now=None, dry_run=False
 
 
 def load_record():
+    """Read the channel-post ledger.
+
+    One corrupt line must not discard the whole ledger: bad lines
+    are skipped and good records stay. A file that cannot be read
+    at all raises (missing is fine -> []); callers treat that as
+    cannot-verify. Same lesson as Neiro's 中-1 (2026-11-21): an
+    exception while reading a dedupe ledger must not read as
+    "no duplicate" and let a send proceed.
+    """
     try:
         with open(POSTS, "r", encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-    except Exception:
+            out = []
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    # 2026-11-21, Yama's question in #slack-へようこそ
+                    # (same point as for reply_once.load_record):
+                    # a skipped corrupt line used to vanish silently,
+                    # so ledger loss went unnoticed. Log the skip
+                    # (line number + truncated content) to stderr;
+                    # good lines still load.
+                    print(f"load_record: skipping corrupt line {lineno} "
+                          f"in {POSTS}: {line[:120]!r}", file=sys.stderr)
+                    continue
+            return out
+    except FileNotFoundError:
         return []
 
 
@@ -280,8 +306,15 @@ def record_ambiguous(channel, message, reason):
 
 
 def already_sent(channel, message):
-    if in_record(message):
-        return "record"
+    try:
+        if in_record(message):
+            return "record"
+    except Exception as e:
+        # Ledger unreadable: cannot verify, refuse to send blind
+        # rather than risk a duplicate parent post.
+        print(f"warning: record check failed ({e}); cannot verify",
+              file=sys.stderr)
+        return "unknown"
     try:
         if message in channel_last_yanayana_texts(channel):
             return "channel"

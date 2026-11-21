@@ -153,6 +153,44 @@ def test_recovery_check_overflow_unverifiable(tmp):
           found is None, f"found={found}")
 
 
+def test_corrupt_ledger_line_kept(tmp):
+    """One corrupt ledger line must not discard the good records.
+
+    Same lesson as Neiro's 中-1 (2026-11-21): a bad line used to
+    kill the whole load_record() list, so a recorded reply read as
+    "not replied" and could be sent twice.
+    """
+    setup(tmp, "corrupt_kept", [parent()])
+    with open(ro.REPLIED, "w", encoding="utf-8") as f:
+        f.write('{"thread_ts": "' + THREAD_TS + '", "target_ts": "' +
+                TARGET_TS + '", "reply_ts": "555.5"}\n')
+        f.write('this is not json\n')
+    found = ro.already_replied("C0TEST", THREAD_TS,
+                               target_ts=TARGET_TS, message=MSG)
+    check("corrupt line + good record -> already-replied record",
+          found == "record", f"found={found}")
+
+
+def test_non_utf8_ledger_unknown(tmp):
+    """A ledger that cannot be decoded is cannot-verify, not
+    "not replied": already_replied is unknown and main refuses
+    to send blind (exit 2)."""
+    setup(tmp, "non_utf8", [parent()])
+    with open(ro.REPLIED, "wb") as f:
+        f.write(b'{"thread_ts": "1000.000000"}\n\xff\xfe bad bytes\n')
+    found = ro.already_replied("C0TEST", THREAD_TS,
+                               target_ts=TARGET_TS, message=MSG)
+    check("non-UTF-8 ledger -> already_replied unknown",
+          found == "unknown", f"found={found}")
+    sent = []
+    ro.send = lambda *a, **k: sent.append(True) or "999.9"
+    rc = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                  "--target-ts", TARGET_TS, "--message", MSG])
+    check("non-UTF-8 ledger -> main exits 2 (cannot-verify)",
+          rc == 2, f"rc={rc}")
+    check("non-UTF-8 ledger -> no send attempted", sent == [])
+
+
 def test_manual_mode_still_pages_full_thread(tmp):
     """No target event (manual post) keeps the full-thread read:
     paging continues past the first page and a same-text reply on a
@@ -176,6 +214,8 @@ def main():
         test_window_overflow_is_fail_closed(tmp)
         test_duplicate_of_other_overflow_raises(tmp)
         test_recovery_check_overflow_unverifiable(tmp)
+        test_corrupt_ledger_line_kept(tmp)
+        test_non_utf8_ledger_unknown(tmp)
         test_manual_mode_still_pages_full_thread(tmp)
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 0 if CHECKS[1] == 0 else 1
