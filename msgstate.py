@@ -18,6 +18,20 @@ is killed; like Neiro's, this is "re-execute the stuck work", which is
 safe only because replies are idempotent (reply_once.py checks the
 thread before sending, so a re-run never double-posts).
 
+Total claim lifetime (2026-11-22, touch-loophole fix discussed in
+#slack-へようこそ thread 1795333580.961869): a claim also goes stale
+when it is older than MAX_CLAIM_SECS from its first mark processing,
+however often touch refreshed updated_at in between. touch alone
+never consumed attempts, so a worker that kept touching could extend
+a claim forever; the sweep now reclaims on claimed_at age too, and
+each reclaim burns one attempt on the next claim, so the loop closes
+at MAX_ATTEMPTS. 30 minutes fits our side: normal claims finish in
+seconds to a few minutes and touch is only used between steps of long
+implementation or test runs. (Neiro's side keeps a 3-hour startup
+grace, so a wall-clock cap from first wake does not fit them the
+same way; Yama's side counts reaps instead -- same principle,
+different shape.)
+
 Usage:
   msgstate.py pending [--limit N | --all]
                              # JSON list of pending/failed messages,
@@ -27,7 +41,10 @@ Usage:
   msgstate.py touch KEY      # refresh a processing entry's
                              # updated_at (claim heartbeat; attempts
                              # unchanged) so long single-item work is
-                             # not swept as stale mid-flight
+                             # not swept as stale mid-flight -- but
+                             # only within MAX_CLAIM_SECS of the
+                             # claim's start; past that it prints
+                             # "expired" and does not extend
   msgstate.py count-pending  # just the number
   msgstate.py oldest-pending-age  # seconds since the oldest pending
                                   # message arrived (empty when none)
@@ -74,6 +91,12 @@ MAX_ATTEMPTS = 3
 # a worker that claimed a message but never finished within 10 minutes
 # is presumed crashed; the poller reclaims it on the next poll.
 TIMEOUT_SECS = 600
+# Total claim lifetime, see the module docstring: a claim is stale
+# once it is older than this from its first mark processing, however
+# often touch refreshed updated_at. Each reclaim burns one attempt
+# on the next claim, so a touching-only worker dead-letters after
+# MAX_ATTEMPTS reclaims at most.
+MAX_CLAIM_SECS = 1800
 # Per-wake batch cap (burst fix, 2026-11-21): `pending` hands a worker
 # at most this many messages, in priority order (see _priority_tier).
 # The uncapped list made one wake try to chew a whole burst of long
@@ -289,6 +312,13 @@ def sweep_stale_locked(state, now=None):
     any entry changed. Attempts < MAX_ATTEMPTS -> back to pending
     (the next poll re-wakes a worker); attempts >= MAX_ATTEMPTS ->
     dead + dead-letter line, mirroring Neiro's "3回を超えたら dead".
+
+    A claim is also stale once its total lifetime exceeds
+    MAX_CLAIM_SECS from claimed_at, however recently touch refreshed
+    updated_at -- that is the touch-loophole fix (2026-11-22):
+    without it a worker that only touches never goes stale and never
+    burns attempts. Entries recorded before claimed_at existed fall
+    back to updated_at as the claim start.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -299,23 +329,31 @@ def sweep_stale_locked(state, now=None):
         updated = _parse_ts(st.get("updated_at") or "")
         if updated is None:
             continue
+        claimed = _parse_ts(st.get("claimed_at") or "") or updated
         age = (now - updated).total_seconds()
-        if age < TIMEOUT_SECS:
+        total_age = (now - claimed).total_seconds()
+        if age < TIMEOUT_SECS and total_age < MAX_CLAIM_SECS:
             continue
         at = now.isoformat()
+        if total_age >= MAX_CLAIM_SECS:
+            reason = (f"claim lifetime exceeded after {int(total_age)}s "
+                      f"(max {MAX_CLAIM_SECS}s)")
+        else:
+            reason = (f"stale processing reclaimed after {int(age)}s "
+                      f"(timeout {TIMEOUT_SECS}s)")
         if st.get("attempts", 0) >= MAX_ATTEMPTS:
             rec = next((r for r in read_inbox() if key_of(r) == key), {"key": key})
             os.makedirs(EVENTS, exist_ok=True)
             with open(DEAD, "a", encoding="utf-8") as f:
                 f.write(json.dumps(
                     {"key": key, "at": at, "attempts": st.get("attempts"),
-                     "last_error": "stale processing reclaimed after "
-                     f"{int(age)}s (timeout {TIMEOUT_SECS}s)",
+                     "last_error": reason,
                      "message": rec}, ensure_ascii=False) + "\n")
             st["status"] = "dead"
         else:
             st["status"] = "pending"
         st["updated_at"] = at
+        st["last_error"] = reason
         state[key] = st
         changed = True
     if changed:
@@ -364,6 +402,15 @@ def cmd_touch(argv):
     this is not a new try, just proof of life. Anything that is not
     currently processing (pending/done/dead/absent) is left exactly
     as it is and its status is printed.
+
+    The heartbeat only extends a claim within MAX_CLAIM_SECS of its
+    start: past that, touch prints "expired" and leaves updated_at
+    alone, so the next sweep reclaims the claim and the next claim
+    burns an attempt. Without this bound a worker that only touches
+    could extend a claim forever without ever consuming attempts
+    (touch loophole, fixed 2026-11-22). Entries recorded before
+    claimed_at existed get it stamped from their last heartbeat on
+    the first touch under the new code.
     """
     if len(argv) < 1:
         print("usage: touch KEY", file=sys.stderr)
@@ -375,7 +422,18 @@ def cmd_touch(argv):
         if not st or st.get("status") != "processing":
             print(st.get("status") if st else "absent")
             return 0
-        st["updated_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
+        claimed = _parse_ts(st.get("claimed_at") or "")
+        if claimed is None:
+            claimed = _parse_ts(st.get("updated_at") or "")
+            if claimed is not None:
+                st["claimed_at"] = claimed.isoformat()
+        if claimed is not None and (now - claimed).total_seconds() >= MAX_CLAIM_SECS:
+            state[key] = st
+            save_state(state)
+            print("expired")
+            return 0
+        st["updated_at"] = now.isoformat()
         state[key] = st
         save_state(state)
     print("touched")
@@ -485,6 +543,10 @@ def _mark_locked(key, status, error):
     now = datetime.now(timezone.utc).isoformat()
     if status == "processing":
         st["attempts"] = st.get("attempts", 0) + 1
+        # Fresh claim: the total-lifetime clock starts here. A later
+        # touch may refresh updated_at but never moves claimed_at,
+        # so the sweep's MAX_CLAIM_SECS bound cannot be dodged.
+        st["claimed_at"] = now
         if st["attempts"] > MAX_ATTEMPTS:
             # Too many attempts: dead-letter the original message.
             rec = next((r for r in read_inbox() if key_of(r) == key), {"key": key})

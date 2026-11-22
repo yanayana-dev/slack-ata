@@ -411,6 +411,73 @@ def main():
     check("naive な updated_at の stale は pending へ戻る",
           items[0]["status"] == "pending" if items else False)
 
+    # 16. claim総時間の上限 (2026-11-22, touchの穴の修正)。
+    # touchだけでは回数を消費しないので、延命し続けるclaimは
+    # 600sのsweepにかからず止まらなかった。最初のmark processing
+    # から最長30分でstaleとして差し戻し、差し戻しのたびに再claim
+    # でattemptsを消費して3回でデッドレター化する。
+    def set_claim_old(base, key, total_secs, heartbeat_secs=0):
+        """claimed_atをtotal_secs前に、updated_atをheartbeat_secs前に置く。"""
+        st = state(base)
+        now = datetime.now(timezone.utc)
+        st[key]["claimed_at"] = (now - timedelta(seconds=total_secs)).isoformat()
+        st[key]["updated_at"] = (now - timedelta(seconds=heartbeat_secs)).isoformat()
+        with open(os.path.join(base, "events", "message_state.json"), "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+
+    base18 = make_base([msg("EvC1", "1794478306.000051")])
+    mark(base18, "EvC1", "processing")
+    st = state(base18)["EvC1"]
+    check("claim時にclaimed_atが記録される", "claimed_at" in st, f"got {st}")
+    claimed = datetime.fromisoformat(st["claimed_at"])
+    check("claimed_atはclaim時刻に近い",
+          abs((datetime.now(timezone.utc) - claimed).total_seconds()) < 60)
+    check("30分以内のtouchはtouchedを返す", touch(base18, "EvC1") == "touched")
+    # updated_atは新しくても、claimから30分超ならsweepで差し戻される
+    set_claim_old(base18, "EvC1", total_secs=2000, heartbeat_secs=0)
+    items = pending(base18)
+    check("touch延命でもclaim総時間30分超はpendingへ戻る",
+          len(items) == 1 and items[0]["key"] == "EvC1", f"got {items}")
+    check("総時間での差し戻しもattemptsは増えない",
+          state(base18)["EvC1"]["attempts"] == 1)
+    # 30分超のclaimへのtouchは延命しない
+    mark(base18, "EvC1", "processing")  # attempts=2, claimed_at更新
+    set_claim_old(base18, "EvC1", total_secs=2000, heartbeat_secs=1200)
+    old_updated = state(base18)["EvC1"]["updated_at"]
+    check("30分超のclaimへのtouchはexpiredを返す",
+          touch(base18, "EvC1") == "expired")
+    check("expiredのtouchはupdated_atを進めない",
+          state(base18)["EvC1"]["updated_at"] == old_updated)
+
+    # claimed_atのない古いエントリ: 初回touchがclaimed_atを刻む
+    base19 = make_base([msg("EvC2", "1794478306.000052")])
+    mark(base19, "EvC2", "processing")
+    st = state(base19)
+    st["EvC2"].pop("claimed_at", None)
+    with open(os.path.join(base19, "events", "message_state.json"), "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    check("claimed_atなしのtouchはtouchedを返す", touch(base19, "EvC2") == "touched")
+    check("touchがclaimed_atを刻む", "claimed_at" in state(base19)["EvC2"])
+
+    # 差し戻し→再claimを繰り返すと3回でデッドレター化する（ループが閉じる）
+    base20 = make_base([msg("EvC3", "1794478306.000053")])
+    mark(base20, "EvC3", "processing")  # attempts=1
+    for _ in range(2):
+        set_claim_old(base20, "EvC3", total_secs=2000, heartbeat_secs=0)
+        items = pending(base20)  # sweep -> pending
+        assert len(items) == 1, items
+        mark(base20, "EvC3", "processing")  # attempts 2, then 3
+        claimed = datetime.fromisoformat(state(base20)["EvC3"]["claimed_at"])
+        assert abs((datetime.now(timezone.utc) - claimed).total_seconds()) < 60
+    set_claim_old(base20, "EvC3", total_secs=2000, heartbeat_secs=0)
+    items = pending(base20)  # sweep: attempts(3) >= MAX -> dead
+    check("claim総時間の差し戻し3回でデッドレター化する",
+          items == [] and state(base20)["EvC3"]["status"] == "dead"
+          and len(dead_letters(base20)) == 1,
+          f"got {items}, {state(base20)['EvC3']}")
+    check("デッドレターに総時間超過の理由が残る",
+          "claim lifetime exceeded" in (dead_letters(base20)[0].get("last_error") or ""))
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1
