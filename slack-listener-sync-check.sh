@@ -52,10 +52,23 @@
 # ずれを watchdog が見る自己参照が残るため）。異常時は Slack へ警告する
 # （重複抑止は署名付き状態ファイル）。正常時は状態ファイルを消して
 # "listener sync: ok" を出して exit 0。
+#
+# 警告の猶予期間（2026-11-22、あたの指摘で追加）: ずれを見つけても
+# 即座には警告しない。同じ署名のずれが SYNC_CHECK_GRACE_SECONDS
+# （既定900秒＝5分間隔で3回分）続いたときだけ警告する。活発に作業
+# している最中は同期前のずれが数分で解消されることが多く、即時警告
+# だと #slack-へようこそ が警告と解消報告で埋まってしまうため。
+# 初回検出時は状態ファイルに署名と first_seen を記録して黙り、署名が
+# 変われば時計はリセットされ、ずれが解消されれば状態ファイルごと
+# 消える。警告済みのずれが変化した場合も、同じ猶予ルールを通す
+# （一貫した扱いにして、作業中の署名の揺れで警告が増えないように）。
+# 警告送信の失敗やチェック自体の異常終了は猶予の対象外で、従来どおり
+# 即座に表面化する（送信失敗は first_seen を残したまま exit 1 になり、
+# runner / watchdog の is-failed 警告が拾う）。
 # systemd は root で動くため、既定パスは $HOME ではなく絶対パスで書く。
 #
 # 環境変数（テスト用）: LIVE_DIR, PUBLIC_DIR, SCRUB_SED, SYNC_CHECK_STATE,
-# SYNC_CHECK_CHANNEL, SLACKCLI, --dry-run。
+# SYNC_CHECK_CHANNEL, SLACKCLI, SYNC_CHECK_GRACE_SECONDS, --dry-run。
 set -u
 LIVE_DIR=${LIVE_DIR:-/path/to/slack-watcher}
 PUBLIC_DIR=${PUBLIC_DIR:-/path/to/workspace/github-publish/slack-ata}
@@ -66,6 +79,9 @@ CHANNEL=${SYNC_CHECK_CHANNEL:-C0EXAMPLE001}
 SLACKCLI=${SLACKCLI:-$BASE/bin/slackcli}
 DRY_RUN=0
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
+# ずれの警告までの猶予（秒）。同じ署名のずれがこの秒数続いたら警告する。
+GRACE_SECONDS=${SYNC_CHECK_GRACE_SECONDS:-900}
+case "$GRACE_SECONDS" in *[!0-9]*|"") GRACE_SECONDS=900 ;; esac
 
 # 稼働中専用で公開しないファイル（名前で指定）。これ以外に稼働中にだけ
 # ある公開対象ファイルがあれば UNPUBLISHED として警告する。
@@ -174,17 +190,52 @@ fi
 
 text=$(printf '%s\n' "${failures[@]}")
 sig=$(printf '%s' "$text" | sha256sum | cut -d' ' -f1)
-prev=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("signature",""))' "$STATE_FILE" 2>/dev/null || echo "")
-if [ "$sig" = "$prev" ]; then
+msg="【リスナー同期チェック】稼働中の ~/workspace/slack-listener と公開用コピーの内容がずれています（専用タイマー slack-sync-check.timer で5分間隔で確認中）:
+$text
+稼働側が正本です。稼働中の内容で公開用コピーを作り直してください。"
+
+# 状態ファイルを読む。旧形式（signature と failures だけ）は警告が
+# 送れたときにだけ書かれていたので、warned キーが無ければ警告済み
+# として扱う。
+prev_sig=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("signature",""))' "$STATE_FILE" 2>/dev/null || echo "")
+prev_first_seen=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("first_seen",0)))' "$STATE_FILE" 2>/dev/null || echo 0)
+prev_warned=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(1 if d.get("warned", True) else 0)' "$STATE_FILE" 2>/dev/null || echo 0)
+
+if [ "$sig" = "$prev_sig" ] && [ "$prev_warned" = "1" ]; then
   echo "listener sync: still failing (already warned)"
   printf '%s\n' "$text"
   echo "NG: ${PROBLEMS}件の問題あり"
   exit 1
 fi
 
-msg="【リスナー同期チェック】稼働中の ~/workspace/slack-listener と公開用コピーの内容がずれています（専用タイマー slack-sync-check.timer で5分間隔で確認中）:
-$text
-稼働側が正本です。稼働中の内容で公開用コピーを作り直してください。"
+NOW=$(date +%s)
+if [ "$sig" = "$prev_sig" ]; then FIRST_SEEN=$prev_first_seen; else FIRST_SEEN=$NOW; fi
+ELAPSED=$((NOW - FIRST_SEEN))
+
+write_state() {
+  # $1 = warned (0/1)。tmp + rename の原子書き（AGENTS.md の作法）。
+  mkdir -p "$(dirname "$STATE_FILE")"
+  local tmp="$STATE_FILE.tmp.$$"
+  SYNC_SIG="$sig" SYNC_FIRST_SEEN="$FIRST_SEEN" SYNC_WARNED="$1" SYNC_FAILURES="$text" \
+    python3 -c 'import json,os; print(json.dumps({"signature": os.environ["SYNC_SIG"], "first_seen": int(os.environ["SYNC_FIRST_SEEN"]), "warned": os.environ["SYNC_WARNED"] == "1", "failures": os.environ["SYNC_FAILURES"]}))' > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+# 猶予期間中は警告せず、署名と first_seen を記録して黙る。ずれの内容は
+# journal には残る（stdout）。runner は NG 行を見て exit 0 に正規化する
+# ので、ユニットが failed になることもない。
+if [ "$ELAPSED" -lt "$GRACE_SECONDS" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "would warn to $CHANNEL after grace period (elapsed ${ELAPSED}s of ${GRACE_SECONDS}s):"
+    printf '%s\n' "$msg"
+  else
+    write_state 0
+    echo "listener sync: drift detected, warning deferred (elapsed ${ELAPSED}s of grace ${GRACE_SECONDS}s)"
+  fi
+  printf '%s\n' "$text"
+  echo "NG: ${PROBLEMS}件の問題あり"
+  exit 1
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   echo "would warn to $CHANNEL:"
   printf '%s\n' "$msg"
@@ -192,15 +243,16 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "NG: ${PROBLEMS}件の問題あり"
   exit 1
 fi
+# 送信前に pending 状態（warned=0）を残す。送信が失敗しても first_seen
+# が残るので、次回は猶予を待たずに再送を試み、失敗は即座に表面化する。
+write_state 0
 if ! "$SLACKCLI" messages send --recipient-id "$CHANNEL" --message "$msg" --json >/dev/null 2>&1; then
   echo "listener sync: Slack warn send failed" >&2
   printf '%s\n' "$text"
   echo "NG: ${PROBLEMS}件の問題あり"
   exit 1
 fi
-tmp="$STATE_FILE.tmp.$$"
-mkdir -p "$(dirname "$STATE_FILE")"
-printf '{"signature": "%s", "failures": %s}' "$sig" "$(printf '%s' "$text" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$tmp" && mv "$tmp" "$STATE_FILE"
+write_state 1
 printf '%s\n' "$text"
 echo "NG: ${PROBLEMS}件の問題あり"
 exit 1

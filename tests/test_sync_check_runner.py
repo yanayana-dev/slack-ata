@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -81,11 +82,14 @@ class Env:
         with open(os.path.join(self.live, name), "w", encoding="utf-8") as f:
             f.write(content if live_content is None else live_content)
 
-    def run_runner(self, extra_args=None, check_script=None):
+    def run_runner(self, extra_args=None, check_script=None, grace=0):
+        # grace=0 keeps the immediate-warn semantics for the older
+        # cases; the grace cases below pass an explicit value.
         env = dict(os.environ,
                    LIVE_DIR=self.live, PUBLIC_DIR=self.pub,
                    SCRUB_SED=self.scrub,
                    SYNC_CHECK_STATE=self.state,
+                   SYNC_CHECK_GRACE_SECONDS=str(grace),
                    SYNC_CHECK_SCRIPT=check_script or CHECK,
                    SLACKCLI=self.fake_cli, WARN_LOG=self.warn_log)
         args = ["bash", RUNNER] + (extra_args or [])
@@ -172,6 +176,33 @@ def main():
     e = Env()
     r = e.run_runner(check_script=os.path.join(e.tmp.name, "no-such.sh"))
     check("missing check script maps to 1", r.returncode == 1)
+    e.cleanup()
+
+    # 9. 猶予期間中の drift（警告はまだ送られていない）も exit 0 に
+    #    正規化される（ユニットを failed にしない）
+    e = Env()
+    e.write_both("auto_join_channels.py", "print('new')\n",
+                 live_content="print('old')\n")
+    r = e.run_runner(grace=3600)
+    check("grace pending drift exits 0", r.returncode == 0
+          and "deferred" in r.stdout and e.warns() == 0)
+    e.cleanup()
+
+    # 10. 猶予を過ぎた警告の送信失敗は即座に exit 1（猶予は送信失敗
+    #     には効かない）。猶予中は送信自体が試みられないので exit 0
+    e = Env(cli_exit=1)
+    e.write_both("auto_join_channels.py", "print('new')\n",
+                 live_content="print('old')\n")
+    r1 = e.run_runner(grace=3600)
+    with open(e.state, encoding="utf-8") as f:
+        data = json.load(f)
+    data["first_seen"] = int(time.time()) - 3601
+    with open(e.state, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    r2 = e.run_runner(grace=3600)
+    check("send failure after grace exits 1 immediately",
+          r1.returncode == 0 and r2.returncode == 1
+          and "Slack warn send failed" in r2.stderr)
     e.cleanup()
 
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")
