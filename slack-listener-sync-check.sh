@@ -62,13 +62,18 @@
 # 変われば時計はリセットされ、ずれが解消されれば状態ファイルごと
 # 消える。警告済みのずれが変化した場合も、同じ猶予ルールを通す
 # （一貫した扱いにして、作業中の署名の揺れで警告が増えないように）。
+# ただし署名が変わり続けると時計が回り続け警告が出ない穴がある、と
+# Yamaさんに指摘された（2026-11-22）。そのためずれ全体の開始時刻
+# drift_since も記録し、ずれが何らかの形で GRACE_CAP_SECONDS（既定
+# は猶予の2倍＝1800秒）続いたら、署名が新しくても警告する。
 # 警告送信の失敗やチェック自体の異常終了は猶予の対象外で、従来どおり
 # 即座に表面化する（送信失敗は first_seen を残したまま exit 1 になり、
 # runner / watchdog の is-failed 警告が拾う）。
 # systemd は root で動くため、既定パスは $HOME ではなく絶対パスで書く。
 #
 # 環境変数（テスト用）: LIVE_DIR, PUBLIC_DIR, SCRUB_SED, SYNC_CHECK_STATE,
-# SYNC_CHECK_CHANNEL, SLACKCLI, SYNC_CHECK_GRACE_SECONDS, --dry-run。
+# SYNC_CHECK_CHANNEL, SLACKCLI, SYNC_CHECK_GRACE_SECONDS,
+# SYNC_CHECK_GRACE_CAP_SECONDS, --dry-run。
 set -u
 LIVE_DIR=${LIVE_DIR:-/path/to/slack-watcher}
 PUBLIC_DIR=${PUBLIC_DIR:-/path/to/workspace/github-publish/slack-ata}
@@ -82,6 +87,10 @@ if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 # ずれの警告までの猶予（秒）。同じ署名のずれがこの秒数続いたら警告する。
 GRACE_SECONDS=${SYNC_CHECK_GRACE_SECONDS:-900}
 case "$GRACE_SECONDS" in *[!0-9]*|"") GRACE_SECONDS=900 ;; esac
+# ずれ全体の警告までの上限（秒）。署名が変わり続けてもこの秒数を越えたら
+# 警告する（Yamaさんの指摘で追加）。既定は猶予の2倍。
+GRACE_CAP_SECONDS=${SYNC_CHECK_GRACE_CAP_SECONDS:-$((GRACE_SECONDS * 2))}
+case "$GRACE_CAP_SECONDS" in *[!0-9]*|"") GRACE_CAP_SECONDS=$((GRACE_SECONDS * 2)) ;; esac
 
 # 稼働中専用で公開しないファイル（名前で指定）。これ以外に稼働中にだけ
 # ある公開対象ファイルがあれば UNPUBLISHED として警告する。
@@ -199,6 +208,7 @@ $text
 # として扱う。
 prev_sig=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("signature",""))' "$STATE_FILE" 2>/dev/null || echo "")
 prev_first_seen=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("first_seen",0)))' "$STATE_FILE" 2>/dev/null || echo 0)
+prev_drift_since=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("drift_since",0)))' "$STATE_FILE" 2>/dev/null || echo 0)
 prev_warned=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(1 if d.get("warned", True) else 0)' "$STATE_FILE" 2>/dev/null || echo 0)
 
 if [ "$sig" = "$prev_sig" ] && [ "$prev_warned" = "1" ]; then
@@ -211,25 +221,35 @@ fi
 NOW=$(date +%s)
 if [ "$sig" = "$prev_sig" ]; then FIRST_SEEN=$prev_first_seen; else FIRST_SEEN=$NOW; fi
 ELAPSED=$((NOW - FIRST_SEEN))
+# ずれ全体の開始時刻。署名が変わっても引き継ぐ（Yamaさんの指摘で追加:
+# 署名が変わり続ける慢性的なずれは、署名ごとの時計だけだと警告が出ない
+# ため）。旧形式の状態ファイルには無いので first_seen で代用する。
+if [ "$prev_first_seen" -gt 0 ]; then
+  if [ "$prev_drift_since" -gt 0 ]; then DRIFT_SINCE=$prev_drift_since; else DRIFT_SINCE=$prev_first_seen; fi
+else
+  DRIFT_SINCE=$NOW
+fi
+OVERALL=$((NOW - DRIFT_SINCE))
 
 write_state() {
   # $1 = warned (0/1)。tmp + rename の原子書き（AGENTS.md の作法）。
   mkdir -p "$(dirname "$STATE_FILE")"
   local tmp="$STATE_FILE.tmp.$$"
-  SYNC_SIG="$sig" SYNC_FIRST_SEEN="$FIRST_SEEN" SYNC_WARNED="$1" SYNC_FAILURES="$text" \
-    python3 -c 'import json,os; print(json.dumps({"signature": os.environ["SYNC_SIG"], "first_seen": int(os.environ["SYNC_FIRST_SEEN"]), "warned": os.environ["SYNC_WARNED"] == "1", "failures": os.environ["SYNC_FAILURES"]}))' > "$tmp" && mv "$tmp" "$STATE_FILE"
+  SYNC_SIG="$sig" SYNC_FIRST_SEEN="$FIRST_SEEN" SYNC_DRIFT_SINCE="$DRIFT_SINCE" SYNC_WARNED="$1" SYNC_FAILURES="$text" \
+    python3 -c 'import json,os; print(json.dumps({"signature": os.environ["SYNC_SIG"], "first_seen": int(os.environ["SYNC_FIRST_SEEN"]), "drift_since": int(os.environ["SYNC_DRIFT_SINCE"]), "warned": os.environ["SYNC_WARNED"] == "1", "failures": os.environ["SYNC_FAILURES"]}))' > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
 # 猶予期間中は警告せず、署名と first_seen を記録して黙る。ずれの内容は
 # journal には残る（stdout）。runner は NG 行を見て exit 0 に正規化する
-# ので、ユニットが failed になることもない。
-if [ "$ELAPSED" -lt "$GRACE_SECONDS" ]; then
+# ので、ユニットが failed になることもない。ただしずれ全体が上限を
+# 越えたら、署名が新しくても警告する（慢性的なずれの見逃し防止）。
+if [ "$ELAPSED" -lt "$GRACE_SECONDS" ] && [ "$OVERALL" -lt "$GRACE_CAP_SECONDS" ]; then
   if [ "$DRY_RUN" = "1" ]; then
-    echo "would warn to $CHANNEL after grace period (elapsed ${ELAPSED}s of ${GRACE_SECONDS}s):"
+    echo "would warn to $CHANNEL after grace period (elapsed ${ELAPSED}s of ${GRACE_SECONDS}s, overall ${OVERALL}s of cap ${GRACE_CAP_SECONDS}s):"
     printf '%s\n' "$msg"
   else
     write_state 0
-    echo "listener sync: drift detected, warning deferred (elapsed ${ELAPSED}s of grace ${GRACE_SECONDS}s)"
+    echo "listener sync: drift detected, warning deferred (elapsed ${ELAPSED}s of grace ${GRACE_SECONDS}s, overall ${OVERALL}s of cap ${GRACE_CAP_SECONDS}s)"
   fi
   printf '%s\n' "$text"
   echo "NG: ${PROBLEMS}件の問題あり"

@@ -90,6 +90,14 @@ class Env:
         with open(self.state, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
+    def backdate_drift(self, seconds):
+        """Move the recorded drift_since into the past (cap elapsed),
+        leaving first_seen (the current signature's clock) untouched."""
+        data = self.state_data()
+        data["drift_since"] = int(time.time()) - seconds
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
     def write_both(self, name, content, live_content=None):
         for base in (self.pub, self.live):
             os.makedirs(os.path.dirname(os.path.join(base, name)),
@@ -401,6 +409,29 @@ def main():
     check("dry run during grace sends nothing", r.returncode == 1
           and e.warns() == 0 and "after grace" in r.stdout
           and not os.path.exists(e.state))
+    e.cleanup()
+
+    # 23. Yamaさんの指摘（2026-11-22）: 署名が変わり続ける慢性的なずれは、
+    # 署名ごとの時計リセットだけだと警告が出ない。ずれ全体の経過が上限
+    # （既定で猶予の2倍）を越えたら、署名が新しくても警告する。
+    e = Env()
+    e.write_both("auto_join_channels.py", "print('new')\n",
+                 live_content="print('old')\n")
+    r1 = e.run(grace=3600)
+    check("cap: first sighting silent and records drift_since",
+          r1.returncode == 1 and e.warns() == 0
+          and "drift_since" in e.state_data())
+    e.write_both("watchdog.sh", "#!/bin/bash\necho new\n",
+                 live_content="#!/bin/bash\necho old\n")
+    r2 = e.run(grace=3600)
+    check("cap: rotating signature still silent within cap",
+          r2.returncode == 1 and e.warns() == 0
+          and "deferred" in r2.stdout)
+    e.backdate_drift(7201)
+    r3 = e.run(grace=3600)
+    check("cap: warns when overall drift exceeds cap despite fresh signature",
+          r3.returncode == 1 and e.warns() == 1
+          and e.state_data().get("warned") is True)
     e.cleanup()
 
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")
