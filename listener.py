@@ -12,7 +12,9 @@ They are never printed, logged, or written to the inbox file.
 import json
 import os
 import re
+import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -167,16 +169,144 @@ def handle_user_dm_event(payload, event, is_duplicate, mark_seen):
     return "appended"
 
 
+def heartbeat_payload(client, now=None):
+    """One heartbeat record for heartbeat.json.
+
+    Beyond the original {at, connected}: "pid" identifies the
+    process generation that wrote the file, and "last_pong_age_s"
+    (seconds since the socket last answered a ping, from the SDK
+    connection) separates "socket alive" from "socket object still
+    present" -- the SDK's is_connected() only checks the latter.
+    """
+    now = now or datetime.now(timezone.utc)
+    payload = {
+        "at": now.isoformat(),
+        "connected": bool(getattr(client, "is_connected", lambda: False)()),
+        "pid": os.getpid(),
+    }
+    session = getattr(client, "current_session", None)
+    last_pong = getattr(session, "last_ping_pong_time", None)
+    if last_pong:
+        payload["last_pong_age_s"] = round(now.timestamp() - last_pong, 1)
+    return payload
+
+
 def write_heartbeat(client):
     try:
         with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
-            json.dump(
-                {"at": datetime.now(timezone.utc).isoformat(),
-                 "connected": bool(getattr(client, "is_connected", lambda: False)())},
-                f,
-            )
+            json.dump(heartbeat_payload(client), f)
     except Exception:
         pass
+
+
+# --- Self-supervision (added 2026-11-22) ---------------------------------
+# On 2026-11-22 the heartbeat stopped for ~11 minutes (09:42:35 to
+# 09:53:44 JST) while this process and its systemd unit stayed
+# "active" and the VM had been up for 54 minutes, so it was not a
+# VM replacement: the process was alive but wedged, and only the
+# watchdog's 5-minute poll + 120s staleness threshold noticed,
+# which is what stretched the outage to ~11 minutes. Code
+# inspection rules out an application lock as the wedge (the old
+# main loop took no locks; is_connected() is a field read), so the
+# fix targets detection and revival rather than one guessed lock:
+#
+# - the heartbeat is written by a dedicated thread that shares no
+#   state with event processing, so a wedged main/socket path no
+#   longer freezes the heartbeat file itself;
+# - HealthTracker counts consecutive unhealthy 15s ticks: if the
+#   socket stays disconnected for 6 ticks (~90s -- the SDK's own
+#   monitor reconnects within ~25s, so 90s of continuous failure
+#   means its recovery gave up), the process exits and systemd
+#   Restart=always revives it in seconds. Tick counting, not
+#   wall-clock, so a host freeze runs no ticks and cannot be
+#   misread as a long outage on resume;
+# - while healthy, each tick also sends a systemd watchdog
+#   keepalive (the unit sets WatchdogSec=120): if the whole
+#   process wedges -- heartbeat thread included -- systemd itself
+#   restarts the service within ~2 minutes, with no polling.
+# Together these bound a wedged-listener outage to ~2 minutes
+# instead of ~11, at zero added polling cost.
+
+SD_WATCHDOG_PING = "WATCHDOG=1"
+HEARTBEAT_INTERVAL_S = 15
+UNHEALTHY_TICKS_BEFORE_EXIT = 6  # 6 x 15s = ~90s
+
+
+def sd_notify(message, environ=None, sock_factory=None):
+    """Send one sd_notify datagram; a no-op outside systemd.
+
+    Returns True when the datagram was handed to the socket.
+    NOTIFY_SOCKET is set by systemd because the unit declares
+    WatchdogSec (with NotifyAccess=main); a leading "@" denotes an
+    abstract socket and is translated to a NUL prefix.
+    """
+    environ = os.environ if environ is None else environ
+    addr = environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return False
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    sock = None
+    try:
+        sock = (sock_factory or socket.socket)(
+            socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.sendto(message.encode("utf-8"), addr)
+        return True
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+class HealthTracker:
+    """Consecutive-tick health of the socket connection."""
+
+    def __init__(self, exit_after_ticks=UNHEALTHY_TICKS_BEFORE_EXIT):
+        self.exit_after_ticks = exit_after_ticks
+        self.unhealthy_ticks = 0
+        self.ever_healthy = False
+
+    def observe(self, connected):
+        if connected:
+            self.ever_healthy = True
+            self.unhealthy_ticks = 0
+        else:
+            self.unhealthy_ticks += 1
+
+    @property
+    def healthy(self):
+        return self.unhealthy_ticks == 0
+
+    @property
+    def should_exit(self):
+        # Never exit before the first healthy observation: startup
+        # transients belong to client.connect() and systemd's
+        # restart of a failed start, not to this escalation.
+        return (self.ever_healthy
+                and self.unhealthy_ticks >= self.exit_after_ticks)
+
+
+def supervision_tick(client, tracker, notify=sd_notify):
+    """One supervision cycle; returns True when the process should exit.
+
+    Writes the heartbeat, pings the systemd watchdog only while
+    healthy (a wedged or disconnected process must stop pinging so
+    systemd restarts it), and reports the tracker's exit decision.
+    A client whose is_connected() raises counts as disconnected.
+    """
+    try:
+        connected = bool(client.is_connected())
+    except Exception:
+        connected = False
+    tracker.observe(connected)
+    write_heartbeat(client)
+    if tracker.healthy:
+        notify(SD_WATCHDOG_PING)
+    return tracker.should_exit
 
 
 def main():
@@ -335,10 +465,36 @@ def main():
     client.socket_mode_request_listeners.append(process)
     client.connect()
     print("listener connected (Socket Mode)", flush=True)
+
+    # Supervision runs on its own thread (see the self-supervision
+    # note above write_heartbeat): the heartbeat file, the systemd
+    # watchdog keepalive, and the dead-socket exit decision must
+    # not share fate with the main thread or the socket callbacks.
+    tracker = HealthTracker()
+
+    def supervision_loop():
+        while True:
+            try:
+                if supervision_tick(client, tracker):
+                    print(
+                        "socket disconnected for "
+                        f"{tracker.unhealthy_ticks} consecutive ticks; "
+                        "exiting so systemd restarts the listener",
+                        file=sys.stderr, flush=True)
+                    # os._exit, not sys.exit: interpreter shutdown
+                    # would wait on the very threads that may be
+                    # wedged. State files are written atomically or
+                    # append-only, so an abrupt exit loses nothing.
+                    os._exit(1)
+            except Exception:
+                pass
+            time.sleep(HEARTBEAT_INTERVAL_S)
+
+    threading.Thread(
+        target=supervision_loop, name="supervision", daemon=True).start()
     try:
         while True:
-            time.sleep(15)
-            write_heartbeat(client)
+            time.sleep(3600)
     except KeyboardInterrupt:
         pass
 

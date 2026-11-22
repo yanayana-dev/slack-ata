@@ -11,6 +11,14 @@ WorkingDirectory=/path/to/slack-watcher
 ExecStart=/path/to/slack-watcher/.venv/bin/python /path/to/slack-watcher/listener.py
 Restart=always
 RestartSec=10
+# The listener's supervision thread sends sd_notify keepalives
+# only while the socket is healthy (listener.py, 2026-11-22): if
+# the process wedges while staying "active" -- as on 2026-11-22
+# 09:42 JST, when the heartbeat froze for ~11 minutes on a live
+# VM -- systemd itself restarts the service after 120s without a
+# keepalive, instead of waiting for the watchdog's 5-minute poll.
+WatchdogSec=120
+NotifyAccess=main
 TimeoutStopSec=15
 KillMode=control-group
 
