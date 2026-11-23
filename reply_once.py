@@ -956,7 +956,13 @@ def main(argv):
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
                          message=message, event_id=event_id)
-            print("sent (recovered: reply found in thread after lost send response)")
+            # The reply_ts stays in the success line (same shape as
+            # the plain send below): send_reply_locked.py parses
+            # "sent reply_ts=" to finalize, and the recovered shape
+            # without it was misread as a send failure there, which
+            # left the replylog record and the state finalization
+            # undone for a reply that had in fact landed.
+            print(f"sent reply_ts={outcome} (recovered: reply found in thread after lost send response)")
             return 0
         reason = ("send-response-lost; recovery check could not verify delivery"
                   if outcome is None else
@@ -975,7 +981,7 @@ def main(argv):
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
                          message=message, event_id=event_id)
-            print("sent (recovered: reply found in thread, send gave no ts)")
+            print(f"sent reply_ts={outcome} (recovered: reply found in thread, send gave no ts)")
             return 0
         reason = ("send gave no ts; recovery check could not verify delivery"
                   if outcome is None else

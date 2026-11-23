@@ -79,6 +79,14 @@ A send failure inside the sweep leaves the entry pending for the
 next hourly pass (until the 24h window expires); delivery is never
 guessed and a found reply is never reposted.
 
+State heal (added 2026-11-23, the bookkeeping seam -- a reply that
+landed but whose finalize writes were lost with the worker run):
+this sweep also runs reconcile_state_heal -- pending/failed inbox
+items with no reply-ledger row are checked for a reply carrying
+their own event_id stamp (recorded recovered when found, never
+reposted), and msgstate's ledger heal then marks done everything
+either reply ledger proves answered. See reconcile_state_heal.
+
 Run log (Yama's share 2026-11-14, slack-yama commit 7188927): each
 sweep appends a started/finished line to events/reconcile_runs.jsonl
 and overwrites events/reconcile_last.json with that run's summary,
@@ -138,6 +146,23 @@ _PM_SPEC = importlib.util.spec_from_file_location(
     "post_metadata", os.path.join(os.path.dirname(os.path.abspath(__file__)), "post_metadata.py"))
 pm = importlib.util.module_from_spec(_PM_SPEC)
 _PM_SPEC.loader.exec_module(pm)
+
+_MS_SPEC = importlib.util.spec_from_file_location(
+    "msgstate", os.path.join(os.path.dirname(os.path.abspath(__file__)), "msgstate.py"))
+ms = importlib.util.module_from_spec(_MS_SPEC)
+_MS_SPEC.loader.exec_module(ms)
+# Same rebasing as reply_once above: msgstate's paths follow this
+# base, not the module's own directory.
+ms.BASE = BASE
+ms.EVENTS = EVENTS
+ms.INBOX = os.path.join(EVENTS, "inbox.jsonl")
+ms.STATE = os.path.join(EVENTS, "message_state.json")
+ms.DEAD = os.path.join(EVENTS, "dead_letter.jsonl")
+ms.LOCK = os.path.join(EVENTS, "message_state.lock")
+ms.STATS = os.path.join(EVENTS, "inbox_stats.json")
+ms.REPLIES_LEDGER = os.path.join(EVENTS, "replies.jsonl")
+ms.REPLIED_LEDGER = os.path.join(EVENTS, "replied.jsonl")
+ms.HEAL_LOG = os.path.join(EVENTS, "state_heal.jsonl")
 
 
 def load_ambiguous():
@@ -633,6 +658,113 @@ def metadata_thread_replies(channel, thread_ts, event_id):
     return out
 
 
+def _stamped_thread_replies(channel, thread_ts, event_id):
+    """Our replies in the thread stamped with exactly this event_id.
+
+    Stricter than metadata_thread_replies: an unstamped reply is NOT
+    proof here. The state-heal sweep has no intended text to match
+    against, so only the metadata stamp ties a reply to this event.
+    Raises RuntimeError when the read cannot be made; the caller
+    leaves the entry untouched.
+    """
+    token = pm.resolve_token()
+    if not token:
+        raise RuntimeError("state heal: token not found")
+    out = []
+    for m in pm.read_thread(channel, thread_ts, token):
+        if m.get("user") != YANAYANA_USER:
+            continue
+        if pm.stamp_event_id(m) == str(event_id):
+            out.append({"ts": m.get("ts"), "text": m.get("text") or ""})
+    return out
+
+
+# State heal (2026-11-23, the bookkeeping seam): do not race a live
+# worker -- an item younger than this may still be mid-finalization.
+STATE_HEAL_MIN_AGE_SECS = 600
+STATE_HEAL_MAX_PER_RUN = 10
+
+
+def reconcile_state_heal(metadata_reader=None, now=None):
+    """Heal message state that never reached done after a reply.
+
+    Two layers, cheapest first in effect:
+    1. Stamped recovery: pending/failed inbox items (not processing,
+       not already in a reply ledger) older than
+       STATE_HEAL_MIN_AGE_SECS are checked against their thread for
+       a reply carrying their own event_id stamp. A process killed
+       between the Slack POST and reply_once's ledger write leaves
+       exactly this shape: the reply is in the thread with the
+       stamp, and no local record exists anywhere. A found reply is
+       recorded (recovered) into replied.jsonl -- never reposted.
+       Matching is stamp-only (no intended text is available for
+       these items), after the target ts, and a reply ts already
+       consumed by another record is never reused.
+    2. Ledger heal: msgstate.heal_replied_locked marks done every
+       inbox message either reply ledger proves answered, including
+       the rows layer 1 just recorded.
+
+    Yama's reconcile-replies (slack-yama) heals the same seam from
+    the thread side for DONE/FAILED rows carrying a reply-ish error;
+    our candidates are the mirror image (state still open, ledger
+    empty) and the stamp replaces their intended-text match.
+    Returns a summary dict.
+    """
+    reader = metadata_reader or _stamped_thread_replies
+    summary = {"checked": 0, "stamped_recovered": 0, "healed": 0,
+               "skipped_read_failed": 0, "details": []}
+    if now is None:
+        now = datetime.now(timezone.utc)
+    with ms.state_lock(exclusive=True):
+        state = ms.load_state()
+        inbox = ms.read_inbox()
+    pairs, ts_only = ms._ledger_targets()
+    candidates = []
+    for rec in inbox:
+        ts = rec.get("ts")
+        if not ts or not rec.get("event_id"):
+            continue
+        st = state.get(ms.key_of(rec)) or {}
+        if st.get("status", "pending") not in ("pending", "failed"):
+            continue
+        if (rec.get("channel"), ts) in pairs or ts in ts_only:
+            continue  # the ledger heal below closes these
+        received = ms._parse_ts(rec.get("received_at") or "")
+        if received is None or (now - received).total_seconds() < STATE_HEAL_MIN_AGE_SECS:
+            continue
+        candidates.append(rec)
+    candidates.sort(key=lambda r: r.get("received_at") or "")
+    used = {r.get("reply_ts") for r in ro.load_record() if r.get("reply_ts")}
+    for rec in candidates[:STATE_HEAL_MAX_PER_RUN]:
+        summary["checked"] += 1
+        thread_ts = rec.get("thread_ts") or rec.get("ts")
+        try:
+            found = reader(rec.get("channel"), thread_ts, rec.get("event_id"))
+        except Exception:
+            summary["skipped_read_failed"] += 1
+            summary["details"].append({"target_ts": rec.get("ts"),
+                                        "result": "skipped_read_failed"})
+            continue
+        hit = next((m for m in found
+                    if m.get("ts") and m["ts"] not in used
+                    and _is_reply_after_event(m["ts"], rec.get("ts"))), None)
+        if hit:
+            ro.record_reply(rec.get("channel"), thread_ts, rec.get("ts"),
+                            hit["ts"], recovered=True,
+                            message=hit.get("text") or None,
+                            event_id=rec.get("event_id"))
+            used.add(hit["ts"])
+            summary["stamped_recovered"] += 1
+            summary["details"].append({"target_ts": rec.get("ts"),
+                                        "result": "stamped_recovered",
+                                        "reply_ts": hit["ts"]})
+    with ms.state_lock(exclusive=True):
+        state = ms.load_state()
+        healed = ms.heal_replied_locked(state)
+    summary["healed"] = len(healed)
+    return summary
+
+
 def reconcile(thread_reader=None, metadata_reader=None):
     """One sweep. Returns a summary dict.
 
@@ -809,6 +941,7 @@ def main(argv):
     try:
         summary = reconcile()
         summary["pending_resends"] = reconcile_pending_resends()
+        summary["state_heal"] = reconcile_state_heal()
         save_last_run(now)
     except Exception as exc:
         _log_run("finished", ok=False, error=str(exc)[:200])

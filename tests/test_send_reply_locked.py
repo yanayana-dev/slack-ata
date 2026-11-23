@@ -70,7 +70,7 @@ MESSAGE = "test reply text"
 def setup_tmp():
     tmp = tempfile.mkdtemp(prefix="sendlock-test-")
     for name in ("send_reply_locked.py", "reply_once.py", "replylog.py",
-                 "post_metadata.py"):
+                 "post_metadata.py", "msgstate.py", "inbox_state.py"):
         shutil.copy(os.path.join(ROOT, name), os.path.join(tmp, name))
     os.makedirs(os.path.join(tmp, "bin"))
     os.makedirs(os.path.join(tmp, "events"))
@@ -209,6 +209,64 @@ def test_metadata_end_to_end(tmp):
         server.server_close()
 
 
+def test_state_key_finalizes(tmp):
+    """--state-key: the wrapper marks the msgstate entry done itself.
+
+    The bookkeeping seam (2026-11-18 / 11-22 / 11-23): the hook flow
+    used to send, record and mark done as three separate agent steps;
+    a run that ended after the send left the answered message
+    pending. Here one inbox message is claimed (processing), the
+    wrapper sends with --state-key, and the state must be done with
+    no further step. A second message whose reply is already in the
+    replylog must also be finalized by the already-replied path
+    without any send.
+    """
+    events = os.path.join(tmp, "events")
+    inbox = [{"event_id": "Ev0STATEKEY1", "channel": CHANNEL,
+              "ts": "7000.000000", "thread_ts": THREAD_TS,
+              "user": "U0OTHER", "text": "question one",
+              "received_at": "2026-11-23T00:00:00+00:00"},
+             {"event_id": "Ev0STATEKEY2", "channel": CHANNEL,
+              "ts": "4000.000000", "thread_ts": THREAD_TS,
+              "user": "U0OTHER", "text": "question two",
+              "received_at": "2026-11-23T00:01:00+00:00"}]
+    with open(os.path.join(events, "inbox.jsonl"), "w", encoding="utf-8") as f:
+        for rec in inbox:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    state = {"Ev0STATEKEY1": {"status": "processing", "attempts": 1},
+             "Ev0STATEKEY2": {"status": "processing", "attempts": 1}}
+    with open(os.path.join(events, "message_state.json"), "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+    def read_state():
+        with open(os.path.join(events, "message_state.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    sends_log = os.path.join(events, "fake_sends.log")
+    before = count_lines(sends_log)
+    r = run_wrapper(tmp, target="7000.000000", message="state key reply",
+                    extra=["--state-key", "Ev0STATEKEY1"])
+    check("state-key send exits 0", r.returncode == 0,
+          f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:200]}")
+    check("state-key send actually sent once",
+          count_lines(sends_log) == before + 1)
+    check("state-key send marks the entry done",
+          read_state().get("Ev0STATEKEY1", {}).get("status") == "done",
+          f"state={read_state().get('Ev0STATEKEY1')}")
+
+    # Already-replied via the pre-seeded replylog row for 4000.000000
+    # (written by the earlier check in main): no send, still done.
+    r = run_wrapper(tmp, target="4000.000000",
+                    extra=["--state-key", "Ev0STATEKEY2"])
+    check("state-key already-replied exits 0 without sending",
+          r.returncode == 0 and "already-replied" in r.stdout
+          and count_lines(sends_log) == before + 1,
+          f"rc={r.returncode} out={r.stdout.strip()}")
+    check("state-key already-replied marks the entry done",
+          read_state().get("Ev0STATEKEY2", {}).get("status") == "done",
+          f"state={read_state().get('Ev0STATEKEY2')}")
+
+
 def main():
     tmp = setup_tmp()
     try:
@@ -265,6 +323,9 @@ def main():
 
         # 5. Metadata path end to end (stub Slack API).
         test_metadata_end_to_end(tmp)
+
+        # 6. --state-key finalizes msgstate inside the wrapper.
+        test_state_key_finalizes(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

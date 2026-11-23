@@ -38,6 +38,14 @@ Usage:
                              # oldest first, capped at
                              # DEFAULT_PENDING_LIMIT unless --limit N
                              # or --all is given (see below)
+  msgstate.py heal-replied [--dry-run]
+                             # mark done every inbox message that a
+                             # reply ledger (replies.jsonl /
+                             # replied.jsonl) proves was answered but
+                             # whose state never reached done -- the
+                             # bookkeeping seam heal (see
+                             # heal_replied_locked). Also runs as part
+                             # of pending/count/oldest-pending-age.
   msgstate.py touch KEY      # refresh a processing entry's
                              # updated_at (claim heartbeat; attempts
                              # unchanged) so long single-item work is
@@ -80,6 +88,12 @@ INBOX = os.path.join(EVENTS, "inbox.jsonl")
 STATE = os.path.join(EVENTS, "message_state.json")
 DEAD = os.path.join(EVENTS, "dead_letter.jsonl")
 LOCK = os.path.join(EVENTS, "message_state.lock")
+# Reply ledgers consulted by the heal (heal_replied_locked):
+# replies.jsonl is replylog.py's ledger, replied.jsonl is
+# reply_once.py's. Either one proving a reply is enough.
+REPLIES_LEDGER = os.path.join(EVENTS, "replies.jsonl")
+REPLIED_LEDGER = os.path.join(EVENTS, "replied.jsonl")
+HEAL_LOG = os.path.join(EVENTS, "state_heal.jsonl")
 # Skipped-row counts for the inbox file (adopted 2026-11-12 from Neiro's
 # suggestion in #slack-へようこそ): read_inbox() skips blank and
 # malformed rows silently, but the *count* of skipped rows is kept here
@@ -361,6 +375,112 @@ def sweep_stale_locked(state, now=None):
     return changed
 
 
+def _ledger_targets():
+    """(channel, target_ts) pairs a reply ledger proves were answered.
+
+    Both ledgers are consulted: replies.jsonl (replylog.py) and
+    replied.jsonl (reply_once.py). A send through send_reply_locked.py
+    lands in both, but a send through either path alone still leaves
+    one trace, and one trace is enough to prove the reply exists.
+    Entries without a channel fall back to a ts-only set, matched
+    against any channel (legacy rows; ts values are unique enough
+    that a cross-channel collision is not a practical risk).
+    Corrupt lines are skipped like every other ledger reader.
+    """
+    pairs = set()
+    ts_only = set()
+    for path in (REPLIES_LEDGER, REPLIED_LEDGER):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    if not e.get("target_ts"):
+                        continue
+                    if e.get("channel"):
+                        pairs.add((e["channel"], e["target_ts"]))
+                    else:
+                        ts_only.add(e["target_ts"])
+        except FileNotFoundError:
+            continue
+    return pairs, ts_only
+
+
+def heal_replied_locked(state, dry_run=False):
+    """Mark done every inbox message a reply ledger proves answered.
+
+    The bookkeeping seam (observed 2026-11-18, 2026-11-22 and
+    2026-11-23): the hook flow finalizes a message in separate steps
+    -- send, then replylog record, then mark done -- so a worker run
+    that ends (timeout, cutoff, error) after the send but before the
+    writes leaves the message pending/failed even though the reply is
+    in the thread and at least one ledger recorded it. The next wake
+    then re-processes an answered message: attempts burn on re-claims
+    and, before this heal, only the re-processing worker's live
+    thread check stood between it and a duplicate or a dead letter.
+
+    This heal closes the gap deterministically from local records
+    (no Slack read): any inbox message whose (channel, ts) appears as
+    a target in either reply ledger is done, whatever its state says.
+    Entries in "processing" are left alone -- a live worker holds
+    that claim and finalizes it itself; if that worker dies, the
+    stale sweep returns the entry to pending and the next heal closes
+    it. "dead" is terminal and never resurrected. Healed entries get
+    a "healed" stamp and a line in events/state_heal.jsonl so the
+    daily summary can count how often the seam still opens.
+
+    Must be called holding the exclusive state lock. Returns the list
+    of healed {"key", "channel", "ts"} dicts.
+    """
+    pairs, ts_only = _ledger_targets()
+    if not pairs and not ts_only:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    healed = []
+    for rec in read_inbox():
+        ts = rec.get("ts")
+        if not ts:
+            continue
+        if (rec.get("channel"), ts) not in pairs and ts not in ts_only:
+            continue
+        key = key_of(rec)
+        st = state.get(key)
+        status = (st or {}).get("status", "pending")
+        if status in ("done", "dead", "processing"):
+            continue
+        healed.append({"key": key, "channel": rec.get("channel"), "ts": ts})
+        if dry_run:
+            continue
+        st = dict(st) if st else {"attempts": 0}
+        st["status"] = "done"
+        st["updated_at"] = now
+        st.pop("last_error", None)
+        st["healed"] = {"source": "reply-ledger", "at": now}
+        state[key] = st
+    if healed and not dry_run:
+        save_state(state)
+        os.makedirs(EVENTS, exist_ok=True)
+        with open(HEAL_LOG, "a", encoding="utf-8") as f:
+            for h in healed:
+                f.write(json.dumps({**h, "at": now}, ensure_ascii=False) + "\n")
+    return healed
+
+
+def cmd_heal_replied(argv):
+    dry_run = "--dry-run" in argv
+    with state_lock(exclusive=True):
+        state = load_state()
+        healed = heal_replied_locked(state, dry_run=dry_run)
+    print(json.dumps({"healed": healed, "count": len(healed),
+                      "dry_run": dry_run}, ensure_ascii=False))
+    return 0
+
+
 def cmd_stats():
     try:
         with open(STATS, "r", encoding="utf-8") as f:
@@ -387,6 +507,7 @@ def cmd_pending(argv):
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
+        heal_replied_locked(state)
         items = pending_items(state, limit=limit)
     print(json.dumps(items, ensure_ascii=False, indent=1))
     return 0
@@ -444,6 +565,7 @@ def cmd_count():
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
+        heal_replied_locked(state)
         n = len(pending_items(state))
     print(n)
 
@@ -484,6 +606,7 @@ def cmd_oldest_pending_age():
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
+        heal_replied_locked(state)
         age = oldest_pending_age(pending_items(state))
     print(age if age is not None else "")
 
@@ -539,6 +662,18 @@ def _mark_locked(key, status, error):
         # Dead is terminal: later marks (e.g. a failed call racing the
         # dead-lettering processing call) must not resurrect the message.
         print("dead")
+        return 0
+    if st.get("status") == "done" and status != "done":
+        # Done is final too: a worker whose claim went stale and was
+        # completed by another worker must not resurrect the message
+        # with a late processing/failed mark. Yama's commit_event has
+        # this exact hole (their candidate 19 in slack-yama
+        # IMPROVEMENTS.md: FAILED committed onto a DONE event brings
+        # it back to PENDING); our dead guard already existed and
+        # done gets the same treatment. No legitimate flow marks a
+        # done message anything but done -- pending_items never hands
+        # out a message any of whose copies is done.
+        print("done")
         return 0
     now = datetime.now(timezone.utc).isoformat()
     if status == "processing":
@@ -606,6 +741,8 @@ def main():
         return cmd_mark(sys.argv[2:])
     if cmd == "reconcile-done":
         return cmd_reconcile_done(sys.argv[2:])
+    if cmd == "heal-replied":
+        return cmd_heal_replied(sys.argv[2:])
     if cmd == "key-of":
         cmd_key_of()
         return 0
