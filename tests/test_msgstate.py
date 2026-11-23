@@ -102,7 +102,11 @@ def make_base(messages):
 
 
 def msg(event_id="EvTest1", ts="1794478306.000001", text="hello"):
-    return {"event_id": event_id, "received_at": "2026-11-12T10:00:00+00:00",
+    # Fresh by default (aging, 2026-11-23): an ancient received_at
+    # would promote every fixture to the top tier and hide the base
+    # tier order. aged_msg() overrides this for age tests.
+    return {"event_id": event_id,
+            "received_at": datetime.now(timezone.utc).isoformat(),
             "channel": "C0EXAMPLE001", "channel_type": "channel",
             "user": "U0EXAMPLEUSER", "text": text, "ts": ts, "thread_ts": None}
 
@@ -607,6 +611,110 @@ def main():
           len(mark_rejected(base26)) == 2
           and mark_rejected(base26)[-1]["key"] == "EvR6",
           f"got {len(mark_rejected(base26))} lines")
+
+    # 19. キューの aging (2026-11-23, Neiro さんの実績値の取り込み)。
+    # 5分超で1段上がり、15分超で最上位へ。ティア内は古い順。
+    # 2026-11-23 の実例: ティア2が宛て投稿の流入で約22分後回しに
+    # され続けた (starvation)。Yama さんは FIFO で不要、Neiro さん
+    # は 2026-11-21 からこの値で運用中で後回しは出ていない。
+    # しきい値は三者統一不要。
+    def aged2(event_id, ts, text, seconds_ago, channel_type="channel"):
+        m = msg2(event_id, ts, text, channel_type)
+        m["received_at"] = (datetime.now(timezone.utc)
+                            - timedelta(seconds=seconds_ago)).isoformat()
+        return m
+
+    base27 = make_base([
+        msg2("EvA1", "1794478306.000071", "雑談です"),
+        msg2("EvA2", "1794478306.000072", "やなやな、教えて"),
+        msg2("EvA3", "1794478306.000073", "DMです", "im"),
+    ])
+    items = pending(base27)
+    check("新しいものはティア順のまま",
+          [it["key"] for it in items] == ["EvA3", "EvA2", "EvA1"],
+          f"got {[it['key'] for it in items]}")
+
+    # 5分超のティア2は1段上がり、新しいティア1より先に来る
+    base28 = make_base([
+        aged2("EvB2", "1794478306.000081", "雑談です", 400),
+        msg2("EvB1", "1794478306.000082", "やなやな、教えて"),
+        msg2("EvB3", "1794478306.000083", "雑談です"),
+    ])
+    items = pending(base28)
+    check("5分超のティア2は1段上がって新しいティア1より先に来る",
+          [it["key"] for it in items] == ["EvB2", "EvB1", "EvB3"],
+          f"got {[it['key'] for it in items]}")
+    # 5分未満では上がらない
+    base29 = make_base([
+        aged2("EvC2", "1794478306.000091", "雑談です", 240),
+        msg2("EvC1", "1794478306.000092", "やなやな、教えて"),
+    ])
+    items = pending(base29)
+    check("5分未満のティア2は上がらない",
+          [it["key"] for it in items] == ["EvC1", "EvC2"],
+          f"got {[it['key'] for it in items]}")
+
+    # 15分超のティア2は最上位へ。DMと同ティアになり、古い順で
+    # DMより先に来る
+    base30 = make_base([
+        aged2("EvD3", "1794478306.000101", "雑談です", 1000),
+        msg2("EvD1", "1794478306.000102", "DMです", "im"),
+        msg2("EvD2", "1794478306.000103", "やなやな、教えて"),
+    ])
+    items = pending(base30)
+    check("15分超のティア2は最上位へ上がりDMより先に来る",
+          [it["key"] for it in items] == ["EvD3", "EvD1", "EvD2"],
+          f"got {[it['key'] for it in items]}")
+    # 15分未満では最上位までは上がらない（1段だけ）
+    base31 = make_base([
+        aged2("EvE3", "1794478306.000111", "雑談です", 840),
+        msg2("EvE1", "1794478306.000112", "DMです", "im"),
+        msg2("EvE2", "1794478306.000113", "やなやな、教えて"),
+    ])
+    items = pending(base31)
+    check("15分未満のティア2は1段だけ上がる（DMの後ろ）",
+          [it["key"] for it in items] == ["EvE1", "EvE3", "EvE2"],
+          f"got {[it['key'] for it in items]}")
+
+    # aging は processing / dead の扱いを変えない
+    base32 = make_base([
+        aged2("EvF1", "1794478306.000121", "雑談です", 1000),
+    ])
+    mark(base32, "EvF1", "processing")
+    check("古い処理中のものは aging でも pending に出ない",
+          pending(base32) == [])
+    mark(base32, "EvF1", "done")
+    check("古い done は aging でも pending に出ない",
+          pending(base32) == [])
+    base33 = make_base([
+        aged2("EvG1", "1794478306.000131", "雑談です", 1000),
+    ])
+    mark(base33, "EvG1", "processing")
+    mark(base33, "EvG1", "failed", "boom")
+    mark(base33, "EvG1", "processing")
+    mark(base33, "EvG1", "failed", "boom2")
+    mark(base33, "EvG1", "processing")
+    mark(base33, "EvG1", "processing")  # attempts 4 > MAX -> dead
+    check("古い dead は aging でも pending に出ない",
+          pending(base33) == []
+          and state(base33)["EvG1"]["status"] == "dead")
+    # received_at が無ければ上がらず、落ちもしない
+    base34 = make_base([
+        msg2("EvH2", "1794478306.000141", "雑談です"),
+        msg2("EvH1", "1794478306.000142", "やなやな、教えて"),
+    ])
+    with open(os.path.join(base34, "events", "inbox.jsonl"),
+              encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    rows[0].pop("received_at", None)
+    with open(os.path.join(base34, "events", "inbox.jsonl"),
+              "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    items = pending(base34)
+    check("received_at が無ければ上がらない（落ちない）",
+          [it["key"] for it in items] == ["EvH1", "EvH2"],
+          f"got {[it['key'] for it in items]}")
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")

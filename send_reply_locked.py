@@ -44,6 +44,12 @@ Usage:
   --event-id is passed through to reply_once.py: the reply is then
   sent metadata-stamped via post_metadata.py and the pre-send
   check looks for our metadata stamp first (see reply_once.py).
+  A specified event-id must exist in local records
+  (seen_event_ids.json, message_state.json, inbox/dm_inbox.jsonl)
+  or the send is refused -- Yama's 2026-11-23 candidate 28,
+  adopted 2026-11-23, so a typo'd id is never stamped as
+  provenance; --allow-unknown-event-id "<reason>" passes it only
+  with an explicit reason.
   Without it the reply is stamped with an auto-generated
   request_id (UUID) instead -- the 2026-11-23 fallback-key hole
   fix: a --state-key that is not an Ev id (fallback channel:ts
@@ -79,9 +85,53 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
 
+def event_id_known(event_id):
+    """True when event_id is a real event we have seen locally.
+
+    Yama's 2026-11-23 candidate 28: a specified event-id is checked
+    for existence before sending, so a typo'd id cannot be stamped
+    as provenance (a wrong stamp would make heal/reconcile trust a
+    false origin). Sources, cheapest first: the seen-event-ids list
+    (newest 1000), the msgstate keys (every event the hook has
+    claimed), and the inbox logs (inbox.jsonl + dm_inbox.jsonl, the
+    full received history -- the seen list is capped, so an older
+    event is only provable from the logs). A missing or unreadable
+    source is skipped, not treated as proof either way.
+    """
+    try:
+        with open(os.path.join(EVENTS, "seen_event_ids.json"),
+                  encoding="utf-8") as f:
+            if event_id in json.load(f):
+                return True
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(EVENTS, "message_state.json"),
+                  encoding="utf-8") as f:
+            if event_id in json.load(f):
+                return True
+    except Exception:
+        pass
+    for name in ("inbox.jsonl", "dm_inbox.jsonl"):
+        try:
+            with open(os.path.join(EVENTS, name), encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        if json.loads(line).get("event_id") == event_id:
+                            return True
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+    return False
+
+
 def main(argv):
     channel = thread_ts = target_ts = message = event_id = request_id = None
     state_key = None
+    allow_unknown_event_id = None
     dry_run = False
     i = 0
     while i < len(argv):
@@ -98,6 +148,8 @@ def main(argv):
             request_id = argv[i + 1]; i += 2
         elif a == "--state-key" and i + 1 < len(argv):
             state_key = argv[i + 1]; i += 2
+        elif a == "--allow-unknown-event-id" and i + 1 < len(argv):
+            allow_unknown_event_id = argv[i + 1]; i += 2
         elif a == "--message" and i + 1 < len(argv):
             message = argv[i + 1]; i += 2
         elif a == "--dry-run":
@@ -108,7 +160,8 @@ def main(argv):
     if not channel or not thread_ts or not target_ts or (not dry_run and not message):
         print("usage: send_reply_locked.py --channel C... --thread-ts T... "
               "--target-ts M... --message TEXT [--event-id Ev...] "
-              "[--request-id UUID] [--state-key KEY] [--dry-run]", file=sys.stderr)
+              "[--request-id UUID] [--state-key KEY] [--dry-run] "
+              "[--allow-unknown-event-id REASON]", file=sys.stderr)
         return 1
     if not event_id and state_key and state_key.startswith("Ev"):
         # The hook flow keys msgstate entries by event_id, so a
@@ -134,6 +187,24 @@ def main(argv):
         request_id = str(uuid.uuid4())
         print(f"note: no --event-id; auto-generated request_id {request_id}",
               file=sys.stderr)
+    if event_id and not event_id_known(event_id):
+        # Yama's 2026-11-23 candidate 28, adopted: a specified
+        # event-id must exist in local records, so a typo'd id is
+        # never stamped as provenance. Only a reasoned explicit
+        # flag passes it (e.g. an event that predates local logs).
+        # Checked before the lock, so a refusal sends nothing and
+        # records nothing; a re-run of an already-sent reply still
+        # needs the flag when the event is unprovable locally.
+        if allow_unknown_event_id is None:
+            print(f"refusing to send: event_id {event_id} is not in "
+                  f"local records (seen_event_ids.json, "
+                  f"message_state.json, inbox/dm_inbox.jsonl); pass "
+                  f"--allow-unknown-event-id \"<reason>\" to send "
+                  f"anyway", file=sys.stderr)
+            return 2
+        print(f"note: event_id {event_id} not in local records; "
+              f"sending anyway (--allow-unknown-event-id "
+              f"{allow_unknown_event_id!r})", file=sys.stderr)
 
     os.makedirs(EVENTS, exist_ok=True)
     # One exclusive lock for the whole check -> send -> record

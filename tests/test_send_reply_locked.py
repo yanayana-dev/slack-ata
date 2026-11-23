@@ -168,6 +168,18 @@ def test_metadata_end_to_end(tmp):
             "SLACK_API_BASE": f"http://127.0.0.1:{port}/api",
             "POST_METADATA_STORE": store,
         }
+        # Candidate 28 (2026-11-23): a specified --event-id must be
+        # in local records, so seed the event this test stamps --
+        # otherwise the wrapper refuses the send as an unprovable
+        # id. (The guard landed after this test was written.)
+        with open(os.path.join(tmp, "events", "inbox.jsonl"), "w",
+                  encoding="utf-8") as f:
+            f.write(json.dumps({"event_id": "Ev0TEST00001",
+                                "channel": CHANNEL, "ts": "6000.000000",
+                                "thread_ts": THREAD_TS, "user": "U0OTHER",
+                                "text": "meta question",
+                                "received_at": "2026-11-23T00:00:00+00:00"},
+                               ensure_ascii=False) + "\n")
         sends_log = os.path.join(tmp, "events", "fake_sends.log")
         replies = os.path.join(tmp, "events", "replies.jsonl")
         replied = os.path.join(tmp, "events", "replied.jsonl")

@@ -143,11 +143,22 @@ DEFAULT_PENDING_LIMIT = 3
 # 2026-11-21 in #slack-へようこそ): a burst must not starve the
 # messages that need a fast reply -- DM first, then messages addressed
 # to Yanayana or to あた, then everything else. Oldest first inside
-# each tier (stable sort over inbox order), so no tier starves
-# forever; the watchdog's oldest-pending-age still watches the
-# backlog as a whole. IDs are scrubbed to placeholders on publish
-# (see scrub.sed). Down-tier starvation under a sustained flood
-# (aging) is a known open point, same as on Neiro's side.
+# each tier (stable sort over inbox order). IDs are scrubbed to
+# placeholders on publish (see scrub.sed).
+#
+# Queue aging (2026-11-23, Neiro's proven thresholds shared in
+# #slack-へようこそ): tiers alone starve the bottom tier under a
+# sustained flood -- on 2026-11-23 a tier-2 message waited ~22
+# minutes while addressed posts kept arriving. A message waiting
+# longer than AGING_PROMOTE_SECS rises one tier; longer than
+# AGING_TOP_SECS it rises to the top tier (same as a DM). Neiro has
+# run these exact values in production since 2026-11-21 with no
+# starvation since; Yama needs no aging (FIFO, no overtaking), and
+# thresholds need not be unified across camps. Age is measured from
+# received_at, the same clock as oldest_pending_age; a message
+# without a parseable received_at is never promoted.
+AGING_PROMOTE_SECS = 300
+AGING_TOP_SECS = 900
 DM_CHANNEL_TYPES = ("im", "mpim")
 YANAYANA_USER_ID = "U0EXAMPLEBOT"
 ATA_USER_ID = "U0EXAMPLEOWNER"
@@ -164,6 +175,33 @@ def _priority_tier(rec):
             or f"<@{ATA_USER_ID}>" in text):
         return 1
     return 2
+
+
+def _effective_tier(rec, now=None):
+    """Base tier adjusted by waiting time (aging).
+
+    Waiting > AGING_PROMOTE_SECS (5 min) rises one tier; waiting >
+    AGING_TOP_SECS (15 min) rises to the top tier. Tier 0 never
+    moves. Within an effective tier the sort is stable over inbox
+    order, so oldest first. Unparseable/missing received_at means
+    age unknown -- no promotion, never a crash.
+    """
+    tier = _priority_tier(rec)
+    if tier == 0:
+        return 0
+    if now is None:
+        now = datetime.now(timezone.utc)
+    received = _parse_ts(rec.get("received_at") or "")
+    if received is None:
+        return tier
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    age = (now - received).total_seconds()
+    if age > AGING_TOP_SECS:
+        return 0
+    if age > AGING_PROMOTE_SECS:
+        return max(0, tier - 1)
+    return tier
 
 
 @contextmanager
@@ -306,11 +344,14 @@ def pending_items(state=None, limit=None):
             "attempts": max(s.get("attempts", 0) for _, s in sts),
             "message": rec,
         })
-    # Priority order (stable: oldest first inside each tier). The cap
-    # below keeps the first N of that order; the deferred rest re-wake
-    # on the next poll. --all also returns priority order so every
-    # consumer sees the same sequence.
-    items.sort(key=lambda it: _priority_tier(it["message"]))
+    # Priority order with aging (see _effective_tier): stable sort,
+    # oldest first inside each effective tier. The cap below keeps
+    # the first N of that order; the deferred rest re-wake on the
+    # next poll. --all also returns priority order so every consumer
+    # sees the same sequence. One clock for the whole sort so two
+    # items straddling a threshold cannot flip mid-sort.
+    now = datetime.now(timezone.utc)
+    items.sort(key=lambda it: _effective_tier(it["message"], now))
     if limit is not None:
         items = items[:limit]
     return items
