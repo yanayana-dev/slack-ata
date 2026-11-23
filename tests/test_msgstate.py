@@ -553,6 +553,61 @@ def main():
     check("ログが書けなくても状態はdoneのまま",
           state(base23)["EvR3"]["status"] == "done")
 
+    # 18. 却下ログのローテーション（Neiro さんのアーカイブ設計の取り込み）
+    # 5MB上限・1世代だけ残す。書き込み失敗時は配送ならぬ mark を止めない。
+    def mark_rejected_rotated(base):
+        path = os.path.join(base, "events", "mark_rejected.jsonl.1")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    base24 = make_base([msg("EvR4", "1794478306.000064")])
+    mark(base24, "EvR4", "processing")
+    mark(base24, "EvR4", "done")
+    # 上限ちょうどまで旧ログを膨らませてから却下を1回起こす
+    log24 = os.path.join(base24, "events", "mark_rejected.jsonl")
+    with open(log24, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"seed": "old"}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"pad": "x" * (5 * 1024 * 1024)},
+                           ensure_ascii=False) + "\n")
+    check("上限超過時の却下markはdoneを返す",
+          mark(base24, "EvR4", "processing") == "done")
+    check("上限超過で旧ログが.1へローテーションする",
+          len(mark_rejected_rotated(base24)) == 2
+          and mark_rejected_rotated(base24)[0].get("seed") == "old",
+          f"got {len(mark_rejected_rotated(base24))} lines")
+    check("ローテーション後の現行ログは新しい却下1行だけ",
+          len(mark_rejected(base24)) == 1
+          and mark_rejected(base24)[0]["key"] == "EvR4",
+          f"got {mark_rejected(base24)}")
+    # 上限未満ではローテーションしない
+    base25 = make_base([msg("EvR5", "1794478306.000065")])
+    mark(base25, "EvR5", "processing")
+    mark(base25, "EvR5", "done")
+    mark(base25, "EvR5", "processing")  # 却下1行・小さいログ
+    check("上限未満では.1は作られない",
+          mark_rejected_rotated(base25) == []
+          and len(mark_rejected(base25)) == 1)
+    # ローテーションに失敗しても却下markはdoneを返す（fail-open）
+    base26 = make_base([msg("EvR6", "1794478306.000066")])
+    mark(base26, "EvR6", "processing")
+    mark(base26, "EvR6", "done")
+    log26 = os.path.join(base26, "events", "mark_rejected.jsonl")
+    with open(log26, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"pad": "x" * (5 * 1024 * 1024)},
+                           ensure_ascii=False) + "\n")
+    os.makedirs(os.path.join(base26, "events", "mark_rejected.jsonl.1"),
+                exist_ok=True)  # .1をディレクトリにして削除不能に
+    check("ローテーション失敗でも却下markはdoneを返す",
+          mark(base26, "EvR6", "processing") == "done")
+    check("ローテーション失敗でも状態はdoneのまま",
+          state(base26)["EvR6"]["status"] == "done")
+    check("ローテーション失敗でも新しい却下は追記される",
+          len(mark_rejected(base26)) == 2
+          and mark_rejected(base26)[-1]["key"] == "EvR6",
+          f"got {len(mark_rejected(base26))} lines")
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1

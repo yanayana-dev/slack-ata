@@ -105,6 +105,11 @@ HEAL_LOG = os.path.join(EVENTS, "state_heal.jsonl")
 # distinct event. The log write is fail-open (see
 # _log_mark_rejected): state integrity matters more than the log.
 MARK_REJECTED_LOG = os.path.join(EVENTS, "mark_rejected.jsonl")
+# Neiro さんの ops_alerts_archive.jsonl と同じ上限・世代数 (2026-11-23,
+# #slack-へようこそ thread 1795420153.646849 での共有から取り込み)。
+# 却下ログは追記専用で消費側がないため、上限なしでは際限なく育つ。
+MARK_REJECTED_MAX_BYTES = 5 * 1024 * 1024
+MARK_REJECTED_ROTATED = MARK_REJECTED_LOG + ".1"
 # Skipped-row counts for the inbox file (adopted 2026-11-12 from Neiro's
 # suggestion in #slack-へようこそ): read_inbox() skips blank and
 # malformed rows silently, but the *count* of skipped rows is kept here
@@ -666,6 +671,23 @@ def cmd_mark(argv):
         return _mark_locked(key, status, error)
 
 
+def _rotate_mark_rejected_log():
+    """5MBを超えたら1世代だけ残してローテーションする。
+
+    Neiro さんのアーカイブと同じ形。失敗しても呼び出し元は止めない
+    (fail-open): ローテーションに失敗したら上限超えのまま追記する。
+    Never raises.
+    """
+    try:
+        if (os.path.exists(MARK_REJECTED_LOG)
+                and os.path.getsize(MARK_REJECTED_LOG) >= MARK_REJECTED_MAX_BYTES):
+            if os.path.exists(MARK_REJECTED_ROTATED):
+                os.remove(MARK_REJECTED_ROTATED)
+            os.replace(MARK_REJECTED_LOG, MARK_REJECTED_ROTATED)
+    except Exception:
+        pass
+
+
 def _log_mark_rejected(key, attempted_status, current_status, reason):
     """Record a terminal-guard rejection of a mark write.
 
@@ -678,6 +700,7 @@ def _log_mark_rejected(key, attempted_status, current_status, reason):
     """
     try:
         os.makedirs(EVENTS, exist_ok=True)
+        _rotate_mark_rejected_log()
         rec = {
             "at": datetime.now(timezone.utc).isoformat(),
             "key": key,
