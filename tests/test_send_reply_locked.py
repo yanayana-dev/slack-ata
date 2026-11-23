@@ -220,51 +220,85 @@ def test_state_key_finalizes(tmp):
     no further step. A second message whose reply is already in the
     replylog must also be finalized by the already-replied path
     without any send.
+
+    The send runs under the stub Slack API: since the 2026-11-23
+    event-id fallback, a --state-key that looks like an event id is
+    used as the metadata stamp, so the reply goes through the stamped
+    post_metadata path and the stamp must carry the state key.
     """
-    events = os.path.join(tmp, "events")
-    inbox = [{"event_id": "Ev0STATEKEY1", "channel": CHANNEL,
-              "ts": "7000.000000", "thread_ts": THREAD_TS,
-              "user": "U0OTHER", "text": "question one",
-              "received_at": "2026-11-23T00:00:00+00:00"},
-             {"event_id": "Ev0STATEKEY2", "channel": CHANNEL,
-              "ts": "4000.000000", "thread_ts": THREAD_TS,
-              "user": "U0OTHER", "text": "question two",
-              "received_at": "2026-11-23T00:01:00+00:00"}]
-    with open(os.path.join(events, "inbox.jsonl"), "w", encoding="utf-8") as f:
-        for rec in inbox:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    state = {"Ev0STATEKEY1": {"status": "processing", "attempts": 1},
-             "Ev0STATEKEY2": {"status": "processing", "attempts": 1}}
-    with open(os.path.join(events, "message_state.json"), "w", encoding="utf-8") as f:
-        json.dump(state, f)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StubSlackAPI)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        StubSlackAPI.posts = []
+        StubSlackAPI.reads = []
+        store = os.path.join(tmp, "store.json")
+        with open(store, "w", encoding="utf-8") as f:
+            json.dump({"workspaces": {"muse-board": {"token": "fake-test-token"}},
+                       "default_workspace": "muse-board"}, f)
+        env_extra = {
+            "SLACK_API_BASE": f"http://127.0.0.1:{port}/api",
+            "POST_METADATA_STORE": store,
+        }
+        events = os.path.join(tmp, "events")
+        inbox = [{"event_id": "Ev0STATEKEY1", "channel": CHANNEL,
+                  "ts": "7000.000000", "thread_ts": THREAD_TS,
+                  "user": "U0OTHER", "text": "question one",
+                  "received_at": "2026-11-23T00:00:00+00:00"},
+                 {"event_id": "Ev0STATEKEY2", "channel": CHANNEL,
+                  "ts": "4000.000000", "thread_ts": THREAD_TS,
+                  "user": "U0OTHER", "text": "question two",
+                  "received_at": "2026-11-23T00:01:00+00:00"}]
+        with open(os.path.join(events, "inbox.jsonl"), "w", encoding="utf-8") as f:
+            for rec in inbox:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        state = {"Ev0STATEKEY1": {"status": "processing", "attempts": 1},
+                 "Ev0STATEKEY2": {"status": "processing", "attempts": 1}}
+        with open(os.path.join(events, "message_state.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
 
-    def read_state():
-        with open(os.path.join(events, "message_state.json"), encoding="utf-8") as f:
-            return json.load(f)
+        def read_state():
+            with open(os.path.join(events, "message_state.json"), encoding="utf-8") as f:
+                return json.load(f)
 
-    sends_log = os.path.join(events, "fake_sends.log")
-    before = count_lines(sends_log)
-    r = run_wrapper(tmp, target="7000.000000", message="state key reply",
-                    extra=["--state-key", "Ev0STATEKEY1"])
-    check("state-key send exits 0", r.returncode == 0,
-          f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:200]}")
-    check("state-key send actually sent once",
-          count_lines(sends_log) == before + 1)
-    check("state-key send marks the entry done",
-          read_state().get("Ev0STATEKEY1", {}).get("status") == "done",
-          f"state={read_state().get('Ev0STATEKEY1')}")
+        sends_log = os.path.join(events, "fake_sends.log")
+        before = count_lines(sends_log)
+        r = run_wrapper(tmp, target="7000.000000", message="state key reply",
+                        extra=["--state-key", "Ev0STATEKEY1"],
+                        env_extra=env_extra)
+        check("state-key send exits 0", r.returncode == 0,
+              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:200]}")
+        check("state-key send posts exactly once via the API",
+              len(StubSlackAPI.posts) == 1
+              and count_lines(sends_log) == before,
+              f"posts={len(StubSlackAPI.posts)} sends={count_lines(sends_log)}")
+        if StubSlackAPI.posts:
+            check("state-key send stamps the state key as event_id",
+                  StubSlackAPI.posts[-1].get("metadata") == {
+                      "event_type": "yanayana_reply",
+                      "event_payload": {"event_id": "Ev0STATEKEY1"}},
+                  f"metadata={StubSlackAPI.posts[-1].get('metadata')}")
+        check("state-key send marks the entry done",
+              read_state().get("Ev0STATEKEY1", {}).get("status") == "done",
+              f"state={read_state().get('Ev0STATEKEY1')}")
 
-    # Already-replied via the pre-seeded replylog row for 4000.000000
-    # (written by the earlier check in main): no send, still done.
-    r = run_wrapper(tmp, target="4000.000000",
-                    extra=["--state-key", "Ev0STATEKEY2"])
-    check("state-key already-replied exits 0 without sending",
-          r.returncode == 0 and "already-replied" in r.stdout
-          and count_lines(sends_log) == before + 1,
-          f"rc={r.returncode} out={r.stdout.strip()}")
-    check("state-key already-replied marks the entry done",
-          read_state().get("Ev0STATEKEY2", {}).get("status") == "done",
-          f"state={read_state().get('Ev0STATEKEY2')}")
+        # Already-replied via the pre-seeded replylog row for 4000.000000
+        # (written by the earlier check in main): no send, still done.
+        r = run_wrapper(tmp, target="4000.000000",
+                        extra=["--state-key", "Ev0STATEKEY2"],
+                        env_extra=env_extra)
+        check("state-key already-replied exits 0 without sending",
+              r.returncode == 0 and "already-replied" in r.stdout
+              and len(StubSlackAPI.posts) == 1
+              and count_lines(sends_log) == before,
+              f"rc={r.returncode} out={r.stdout.strip()}")
+        check("state-key already-replied marks the entry done",
+              read_state().get("Ev0STATEKEY2", {}).get("status") == "done",
+              f"state={read_state().get('Ev0STATEKEY2')}")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def main():

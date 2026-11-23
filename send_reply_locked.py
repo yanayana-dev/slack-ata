@@ -100,6 +100,18 @@ def main(argv):
               "--target-ts M... --message TEXT [--event-id Ev...] "
               "[--state-key KEY] [--dry-run]", file=sys.stderr)
         return 1
+    if not event_id and state_key and state_key.startswith("Ev"):
+        # The hook flow keys msgstate entries by event_id, so a
+        # --state-key that looks like an event id IS the originating
+        # event. Default the stamp from it instead of sending
+        # unstamped: Yama's 2026-11-23 metadata finding -- an
+        # unstamped reply is invisible to reconcile detection and to
+        # re-entry blocking, and the hole is exactly "the caller
+        # forgot --event-id". Fallback channel:ts keys do not start
+        # with "Ev", so they still send unstamped as before.
+        event_id = state_key
+        print(f"note: --event-id not given; stamping from --state-key {event_id}",
+              file=sys.stderr)
 
     os.makedirs(EVENTS, exist_ok=True)
     # One exclusive lock for the whole check -> send -> record
