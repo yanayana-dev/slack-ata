@@ -344,15 +344,20 @@ fi
 # the hook itself cannot notice when it has stopped -- an event-driven
 # hook cannot run to report its own death -- so this timer-driven
 # watchdog checks the oldest unprocessed inbox message. The threshold
-# is 180s, deliberately later than the 120s heartbeat restart above,
-# so the warning is an escalation for "the restart did not fix it",
-# not a pre-warning (a transient flap must not cry wolf). Dedup is one
+# is 900s (raised from 180s on 2026-11-23, Yama's share in thread
+# 1795400905.365719): measured post-to-confirm latency is median 177s,
+# p90 577s, so 180s cried wolf on roughly half of slow batches. 900s
+# stays well above normal slow processing while still catching a
+# genuinely dead hook within ~15-20 min. It is deliberately later than
+# the 120s heartbeat restart above, so the warning is an escalation
+# for "the restart did not fix it", not a pre-warning (a transient
+# flap must not cry wolf). Dedup is one
 # flag file: created when a warning is sent, removed when the queue
 # drains, so an unresolved stall warns once and a self-recovery resets
 # the latch (no hash state file needed). Never blocks the watchdog:
 # every step is best-effort and the script still exits 0 below.
 STALL_FLAG=${WATCHDOG_STALL_FLAG:-$BASE/events/pending_stall.flag}
-STALL_THRESHOLD=${WATCHDOG_STALL_THRESHOLD:-180}
+STALL_THRESHOLD=${WATCHDOG_STALL_THRESHOLD:-900}
 STALL_CHANNEL=${WATCHDOG_STALL_CHANNEL:-C0EXAMPLE001}
 stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "")
 if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
