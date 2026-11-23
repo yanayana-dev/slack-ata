@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import uuid as uuid_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -31,6 +32,7 @@ SPEC.loader.exec_module(cso)
 ORIG_LAST = cso.channel_last_yanayana_texts  # real fn; setup() stubs it
 ORIG_SENT = cso.already_sent  # real fn; some tests stub it
 ORIG_READ = cso.channel_read_page_retry  # real fn; setup() restores it
+ORIG_SEND = cso.send  # real fn; setup() stubs it
 
 CHECKS = [0, 0]  # [passed, failed]
 
@@ -58,7 +60,7 @@ def setup(tmp, name):
     # stub that read too: an empty page means "no other author has
     # this text". Tests that exercise the real read restore ORIG_READ.
     cso.channel_read_page_retry = lambda *a, **k: {"messages": []}
-    cso.send = lambda *a, **k: "444.4"
+    cso.send = lambda *a, **k: ("444.4", "test-request-id")
 
 
 def read_jsonl(path):
@@ -74,7 +76,7 @@ def test_check_only_duplicate_in_channel(tmp):
     setup(tmp, "dup_channel")
     cso.channel_last_yanayana_texts = lambda *a, **k: ["other", MSG]
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(CHECK_ARGS))
     check("check-only + text in channel -> exit 0", rc == 0, f"rc={rc}")
     check("check-only + text in channel -> no send attempted", sent == [])
@@ -96,6 +98,8 @@ def test_normal_send(tmp):
     check("normal send -> record with post_ts",
           len(recs) == 1 and recs[0].get("post_ts") == "444.4"
           and recs[0].get("recovered") is False)
+    check("normal send -> record carries the request_id stamp",
+          len(recs) == 1 and recs[0].get("request_id") == "test-request-id")
     check("normal send -> no ambiguous record",
           read_jsonl(cso.AMBIGUOUS) == [])
 
@@ -107,7 +111,7 @@ def test_record_hit_blocks_without_live_read(tmp):
         RuntimeError("read failed"))
     cso.record_post("C0TEST", MSG, "444.4")
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("record hit -> exit 0", rc == 0, f"rc={rc}")
     check("record hit -> no send attempted", sent == [])
@@ -119,7 +123,7 @@ def test_cannot_verify(tmp):
     cso.channel_last_yanayana_texts = lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("read failed"))
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("cannot-verify -> exit 2", rc == 2, f"rc={rc}")
     check("cannot-verify -> no send attempted", sent == [])
@@ -186,7 +190,7 @@ def test_duplicate_of_other_blocks(tmp):
                          {"user": cso.YANAYANA_USER, "text": "mine"}]}
     cso.channel_read_page_retry = lambda *a, **k: page
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("duplicate of other author -> exit 4", rc == 4, f"rc={rc}")
     check("duplicate of other author -> no send attempted", sent == [])
@@ -220,7 +224,7 @@ def test_duplicate_check_read_failure(tmp):
     cso.channel_read_page_retry = lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("read failed"))
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("duplicate check read fails -> exit 2", rc == 2, f"rc={rc}")
     check("duplicate check read fails -> no send attempted", sent == [])
@@ -241,7 +245,7 @@ def test_corrupt_line_kept(tmp):
                 ' "recovered": false, "at": "2026-11-21T00:00:00+00:00"}\n')
         f.write('this is not json\n')
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("corrupt line + good record -> exit 0", rc == 0, f"rc={rc}")
     check("corrupt line + good record -> no send attempted", sent == [])
@@ -254,7 +258,7 @@ def test_non_utf8_ledger_cannot_verify(tmp):
     with open(cso.POSTS, "wb") as f:
         f.write(b'{"channel": "C0TEST", "text": "x"}\n\xff\xfe bad bytes\n')
     sent = []
-    cso.send = lambda *a, **k: sent.append(True) or "444.4"
+    cso.send = lambda *a, **k: sent.append(True) or ("444.4", "test-request-id")
     rc = cso.main(list(ARGS))
     check("non-UTF-8 ledger -> exit 2", rc == 2, f"rc={rc}")
     check("non-UTF-8 ledger -> no send attempted", sent == [])
@@ -274,6 +278,103 @@ def test_bad_line_does_not_block_new_send(tmp):
     check("bad line only + new text -> exit 0", rc == 0, f"rc={rc}")
     check("bad line only + new text -> record written",
           len(recs) == 1 and recs[0].get("post_ts") == "444.4")
+
+
+def test_send_stamps_request_id(tmp):
+    """Real send() stamps the parent post with an auto-generated
+    request_id (2026-11-23 candidate 28: the explicit "付けない宣言"
+    for posts with no originating event) and returns it with the ts.
+    """
+    import uuid as uuid_mod
+    setup(tmp, "stamp")
+    cso.send = ORIG_SEND
+    calls = []
+
+    class FakePM:
+        @staticmethod
+        def send_reply(channel, thread_ts, message, request_id=None,
+                       **kw):
+            calls.append({"channel": channel, "thread_ts": thread_ts,
+                          "message": message, "request_id": request_id})
+            return True, {"ts": "555.5", "channel": channel}
+
+    sys.modules["post_metadata"] = FakePM()
+    try:
+        ts1, rid1 = cso.send("C0TEST", MSG)
+        ts2, rid2 = cso.send("C0TEST", MSG)
+    finally:
+        del sys.modules["post_metadata"]
+    check("stamped send -> returns the post ts",
+          ts1 == "555.5" and ts2 == "555.5", f"ts1={ts1} ts2={ts2}")
+    check("stamped send -> parent post (no thread_ts)",
+          len(calls) == 2 and all(c["thread_ts"] is None for c in calls),
+          f"calls={calls}")
+    check("stamped send -> request_id is a UUID",
+          all(_is_uuid(c["request_id"]) for c in calls),
+          f"calls={calls}")
+    check("stamped send -> each send gets a fresh request_id",
+          rid1 != rid2 and rid1 == calls[0]["request_id"]
+          and rid2 == calls[1]["request_id"],
+          f"rid1={rid1} rid2={rid2}")
+
+
+def _is_uuid(value):
+    try:
+        return str(uuid_mod.UUID(str(value))) == str(value)
+    except Exception:
+        return False
+
+
+def test_send_failure_raises(tmp):
+    """Real send() raises RuntimeError when post_metadata fails,
+    so main() runs the recovery flow instead of recording a send."""
+    setup(tmp, "stamp_fail")
+    cso.send = ORIG_SEND
+
+    class FakePM:
+        @staticmethod
+        def send_reply(*a, **k):
+            return False, "token_not_found"
+
+    sys.modules["post_metadata"] = FakePM()
+    try:
+        raised = None
+        try:
+            cso.send("C0TEST", MSG)
+        except RuntimeError as e:
+            raised = str(e)
+    finally:
+        del sys.modules["post_metadata"]
+    check("failed send -> RuntimeError", raised is not None, f"raised={raised}")
+    check("failed send -> reason carried",
+          raised is not None and "token_not_found" in raised, f"raised={raised}")
+
+
+def test_main_records_real_request_id(tmp):
+    """Full main() flow with the real send(): the ledger record
+    carries the request_id the post was stamped with."""
+    setup(tmp, "main_stamp")
+    cso.send = ORIG_SEND
+    seen = {}
+
+    class FakePM:
+        @staticmethod
+        def send_reply(channel, thread_ts, message, request_id=None,
+                       **kw):
+            seen["request_id"] = request_id
+            return True, {"ts": "666.6", "channel": channel}
+
+    sys.modules["post_metadata"] = FakePM()
+    try:
+        rc = cso.main(list(ARGS))
+    finally:
+        del sys.modules["post_metadata"]
+    recs = read_jsonl(cso.POSTS)
+    check("main + real send -> exit 0", rc == 0, f"rc={rc}")
+    check("main + real send -> record carries the stamped request_id",
+          len(recs) == 1 and recs[0].get("request_id") == seen.get("request_id")
+          and recs[0].get("post_ts") == "666.6",
+          f"recs={recs} seen={seen}")
 
 
 def test_single_call_latest_50(tmp):

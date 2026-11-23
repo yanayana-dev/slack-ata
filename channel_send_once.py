@@ -44,6 +44,17 @@ helper closes that gap, mirroring Neiro's design:
     channel before deciding anything; if delivery cannot be proven,
     record ambiguous_post_outcome and do not repost blindly.
 
+  * Stamping (2026-11-23, Yama's candidate 28, adopted): a parent
+    post has no originating event, so it is sent with an
+    auto-generated request_id stamp via post_metadata.py (direct
+    chat.postMessage with metadata, no thread_ts) instead of going
+    out unstamped through slackcli -- the explicit "付けない宣言":
+    the same two-choice rule as the thread-reply path (event_id or
+    an explicit declaration, never unstamped). The request_id is a
+    duplicate-prevention nonce, not a provenance claim, and it is
+    recorded in channel_posts.jsonl alongside the post_ts so a
+    later reader can tell which stamp proves the post.
+
 Usage:
   channel_send_once.py --channel C0... --message "..."
   channel_send_once.py --channel C0... --message "..." --check-only
@@ -69,6 +80,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -295,14 +307,21 @@ def recovery_check(channel, message, attempts=3):
     return None
 
 
-def record_post(channel, message, post_ts, recovered=False):
+def record_post(channel, message, post_ts, recovered=False,
+                request_id=None):
+    entry = {
+        "channel": channel, "text": message, "post_ts": post_ts,
+        "recovered": recovered,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    if request_id is not None:
+        # The explicit no-event declaration for this post (2026-11-23
+        # candidate 28): the request_id stamp it carries, so the
+        # ledger proves the post was sent stamped, not unstamped.
+        entry["request_id"] = request_id
     os.makedirs(EVENTS, exist_ok=True)
     with open(POSTS, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "channel": channel, "text": message, "post_ts": post_ts,
-            "recovered": recovered,
-            "at": datetime.now(timezone.utc).isoformat(),
-        }, ensure_ascii=False) + "\n")
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def record_ambiguous(channel, message, reason):
@@ -339,16 +358,32 @@ def already_sent(channel, message):
 
 
 def send(channel, message):
-    r = subprocess.run(
-        [SLACKCLI, "messages", "send", "--recipient-id", channel,
-         "--message", message, "--json"],
-        capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        raise RuntimeError(f"slackcli send failed: {r.stderr.strip()[:300]}")
-    out = r.stdout
-    i = out.find("{")
-    data = json.loads(out[i:]) if i >= 0 else {}
-    return data.get("ts") or data.get("message", {}).get("ts")
+    """Send a parent post, stamped with an auto-generated request_id.
+
+    Returns (post_ts, request_id). A parent post has no originating
+    event, so the stamp is the explicit "付けない宣言" (2026-11-23
+    candidate 28, adopted): the post goes out through
+    post_metadata.py (direct chat.postMessage with metadata, no
+    thread_ts) instead of slackcli's unstamped `messages send`, so
+    no send through this helper is ever unstamped. The request_id
+    is a duplicate-prevention nonce, not a provenance claim -- an
+    event_id is never invented. Raises RuntimeError when the send
+    fails, so the caller runs the same recovery flow as before
+    (a lost response may mean the post landed; never repost blind).
+    The import is lazy: this module is loaded by tests via
+    importlib without its directory on sys.path, and tests stub
+    send() outright, so the import must only happen on the real
+    send path (same pattern as the lazy ledger_health import in
+    load_record).
+    """
+    import post_metadata  # lazy, see docstring
+    request_id = str(uuid.uuid4())
+    ok, result = post_metadata.send_reply(
+        channel, None, message, request_id=request_id)
+    if not ok:
+        raise RuntimeError(f"post_metadata send failed: {result}")
+    ts = result.get("ts") if isinstance(result, dict) else None
+    return ts, request_id
 
 
 def main(argv):
@@ -417,8 +452,9 @@ def main(argv):
         return 4
 
     post_ts = None
+    request_id = None
     try:
-        post_ts = send(channel, message)
+        post_ts, request_id = send(channel, message)
     except Exception as e:
         # The send response was lost: the post may still have landed.
         # Confirm from the live channel before deciding anything.
@@ -452,7 +488,7 @@ def main(argv):
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
-    record_post(channel, message, post_ts)
+    record_post(channel, message, post_ts, request_id=request_id)
     print(f"sent post_ts={post_ts}")
     return 0
 
