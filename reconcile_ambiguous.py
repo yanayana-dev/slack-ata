@@ -765,6 +765,109 @@ def reconcile_state_heal(metadata_reader=None, now=None):
     return summary
 
 
+# Landed-dead detection (added 2026-11-23, the "着地済み dead"
+# thread in #slack-へようこそ, 1795438575.469479): a dead-lettered
+# inbox item whose reply actually landed leaves the state saying
+# "failed" while the ledger proves "sent" -- and a later manual
+# re-injection of the same target would double-post. This sweep
+# only detects and alerts; it never changes state and never
+# re-injects (agreed with Yama and Neiro: alert-only).
+# Two buckets, kept apart so a later reader can judge at a glance
+# (Neiro's proposal): "landed" (a reply ledger row proves the
+# target was answered) vs "undetermined" (no ledger row -- the
+# reply may never have been sent, or may have been sent before
+# the ledgers existed). Overlap with Yama's candidate 27 (their
+# reconcile detects "ledger landed + event still failed" and
+# blocks re-injection): candidate 27 does not blanket-exclude
+# dead, so the landed bucket is the same signal on their side --
+# kept here because our dead file needs its own watch and because
+# the undetermined bucket is new; the landed bucket is the
+# shared signal, the undetermined bucket is this sweep's addition.
+LANDED_DEAD_ALERTS = os.path.join(EVENTS, "landed_dead_alerts.jsonl")
+
+
+def load_dead():
+    try:
+        with open(ms.DEAD, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except Exception:
+        return []
+
+
+def _load_alerted_dead():
+    """(key, verdict) pairs already written to the alert file."""
+    seen = set()
+    try:
+        with open(LANDED_DEAD_ALERTS, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                seen.add((e.get("key"), e.get("verdict")))
+    except Exception:
+        return set()
+    return seen
+
+
+def _append_landed_dead_alert(entry):
+    os.makedirs(EVENTS, exist_ok=True)
+    with open(LANDED_DEAD_ALERTS, "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def reconcile_landed_dead():
+    """Detect dead-lettered items whose reply landed (or not).
+
+    Reads dead_letter.jsonl and checks each item against the reply
+    ledgers (both replies.jsonl and replied.jsonl, via
+    msgstate._ledger_targets -- one ledger row is enough proof).
+    Returns {"checked", "landed", "undetermined", "new_alerts",
+    "details": [{"key", "target_ts", "channel", "verdict"}]}.
+    A new alert line is appended to landed_dead_alerts.jsonl the
+    first time a (key, verdict) pair is seen, so the hourly sweep
+    does not repeat the same alert; a verdict change (undetermined
+    -> landed, if a ledger row appears later) alerts again under
+    the new verdict. No state is changed and nothing is re-sent.
+    """
+    summary = {"checked": 0, "landed": 0, "undetermined": 0,
+               "new_alerts": 0, "details": []}
+    pairs, ts_only = ms._ledger_targets()
+    alerted = _load_alerted_dead()
+    for entry in load_dead():
+        msg = entry.get("message") or {}
+        channel = msg.get("channel")
+        ts = msg.get("ts")
+        if not channel or not ts:
+            continue
+        summary["checked"] += 1
+        landed = (channel, ts) in pairs or ts in ts_only
+        verdict = "landed" if landed else "undetermined"
+        key = entry.get("key") or msg.get("event_id") or f"{channel}:{ts}"
+        summary["landed" if landed else "undetermined"] += 1
+        summary["details"].append({"key": key, "target_ts": ts,
+                                    "channel": channel, "verdict": verdict})
+        if (key, verdict) not in alerted:
+            _append_landed_dead_alert({
+                "key": key, "verdict": verdict,
+                "target_ts": ts, "channel": channel,
+                "dead_at": entry.get("at"),
+                "last_error": entry.get("last_error"),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            alerted.add((key, verdict))
+            summary["new_alerts"] += 1
+    return summary
+
+
 def reconcile(thread_reader=None, metadata_reader=None):
     """One sweep. Returns a summary dict.
 
@@ -942,6 +1045,7 @@ def main(argv):
         summary = reconcile()
         summary["pending_resends"] = reconcile_pending_resends()
         summary["state_heal"] = reconcile_state_heal()
+        summary["landed_dead"] = reconcile_landed_dead()
         save_last_run(now)
     except Exception as exc:
         _log_run("finished", ok=False, error=str(exc)[:200])

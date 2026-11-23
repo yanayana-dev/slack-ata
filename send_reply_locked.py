@@ -38,13 +38,20 @@ ledgers) is the backstop if this process itself dies mid-sequence.
 Usage:
   send_reply_locked.py --channel C... --thread-ts T... --target-ts M...
                        --message "..." [--event-id Ev...]
-                       [--state-key KEY] [--dry-run]
+                       [--request-id UUID] [--state-key KEY] [--dry-run]
   --dry-run acquires the lock and runs the checks, then reports
   what would be sent without sending.
   --event-id is passed through to reply_once.py: the reply is then
   sent metadata-stamped via post_metadata.py and the pre-send
   check looks for our metadata stamp first (see reply_once.py).
-  Without it the slackcli send and text-only check are used.
+  Without it the reply is stamped with an auto-generated
+  request_id (UUID) instead -- the 2026-11-23 fallback-key hole
+  fix: a --state-key that is not an Ev id (fallback channel:ts
+  keys) used to send unstamped, invisible to reconcile detection
+  and re-entry blocking. Now every send through this wrapper
+  carries a stamp: event_id when the originating event is known,
+  an auto-generated request_id otherwise. An explicit --request-id
+  may also be given; it is used as-is.
 
 Exit codes: 0 = sent, already-replied (no-op), dry-run ok, or a
 duplicate-text/own-ledger guard refused the send (nothing was sent);
@@ -58,6 +65,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = os.path.join(BASE, "events")
@@ -72,7 +80,7 @@ def run(cmd):
 
 
 def main(argv):
-    channel = thread_ts = target_ts = message = event_id = None
+    channel = thread_ts = target_ts = message = event_id = request_id = None
     state_key = None
     dry_run = False
     i = 0
@@ -86,6 +94,8 @@ def main(argv):
             target_ts = argv[i + 1]; i += 2
         elif a == "--event-id" and i + 1 < len(argv):
             event_id = argv[i + 1]; i += 2
+        elif a == "--request-id" and i + 1 < len(argv):
+            request_id = argv[i + 1]; i += 2
         elif a == "--state-key" and i + 1 < len(argv):
             state_key = argv[i + 1]; i += 2
         elif a == "--message" and i + 1 < len(argv):
@@ -98,7 +108,7 @@ def main(argv):
     if not channel or not thread_ts or not target_ts or (not dry_run and not message):
         print("usage: send_reply_locked.py --channel C... --thread-ts T... "
               "--target-ts M... --message TEXT [--event-id Ev...] "
-              "[--state-key KEY] [--dry-run]", file=sys.stderr)
+              "[--request-id UUID] [--state-key KEY] [--dry-run]", file=sys.stderr)
         return 1
     if not event_id and state_key and state_key.startswith("Ev"):
         # The hook flow keys msgstate entries by event_id, so a
@@ -107,10 +117,22 @@ def main(argv):
         # unstamped: Yama's 2026-11-23 metadata finding -- an
         # unstamped reply is invisible to reconcile detection and to
         # re-entry blocking, and the hole is exactly "the caller
-        # forgot --event-id". Fallback channel:ts keys do not start
-        # with "Ev", so they still send unstamped as before.
+        # forgot --event-id".
         event_id = state_key
         print(f"note: --event-id not given; stamping from --state-key {event_id}",
+              file=sys.stderr)
+    if not event_id and not request_id:
+        # No originating event: stamp with an auto-generated
+        # request_id nonce instead of sending unstamped. This closes
+        # the fallback-key hole (2026-11-23): a --state-key that is
+        # not an Ev id (channel:ts fallback keys) used to fall
+        # through here with no stamp at all. A request_id is a
+        # duplicate-prevention nonce, not a provenance claim, so
+        # generating one never fabricates an event_id (per the
+        # three-way "両方を使い分ける" agreement: event_id is never
+        # invented, request_id is always attached).
+        request_id = str(uuid.uuid4())
+        print(f"note: no --event-id; auto-generated request_id {request_id}",
               file=sys.stderr)
 
     os.makedirs(EVENTS, exist_ok=True)
@@ -120,7 +142,8 @@ def main(argv):
         fcntl.flock(lockf, fcntl.LOCK_EX)
         try:
             return _send_locked(channel, thread_ts, target_ts, message,
-                                dry_run, event_id, state_key)
+                                dry_run, event_id, state_key,
+                                request_id=request_id)
         finally:
             fcntl.flock(lockf, fcntl.LOCK_UN)
 
@@ -148,7 +171,7 @@ def _mark_done(state_key):
 
 
 def _send_locked(channel, thread_ts, target_ts, message, dry_run,
-                 event_id=None, state_key=None):
+                 event_id=None, state_key=None, request_id=None):
     # 1. replylog ledger (events/replies.jsonl, the hook flow's ledger).
     r = run([sys.executable, REPLYLOG, "check", "--target-ts", target_ts])
     if r.returncode != 0:
@@ -169,12 +192,15 @@ def _send_locked(channel, thread_ts, target_ts, message, dry_run,
     # same-text check, the parroting guards, the send, and the
     # lost-response recovery -- all inside this lock. With
     # --event-id the send is metadata-stamped (post_metadata.py)
-    # and the pre-send check looks for the stamp first.
+    # and the pre-send check looks for the stamp first; with
+    # --request-id the same stamp carries the nonce instead.
     cmd = [sys.executable, REPLY_ONCE, "--channel", channel,
            "--thread-ts", thread_ts, "--target-ts", target_ts,
            "--message", message]
     if event_id:
         cmd += ["--event-id", event_id]
+    if request_id:
+        cmd += ["--request-id", request_id]
     r = run(cmd)
     out = (r.stdout or "").strip()
     err = (r.stderr or "").strip()

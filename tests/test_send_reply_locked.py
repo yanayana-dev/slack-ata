@@ -182,7 +182,7 @@ def test_metadata_end_to_end(tmp):
               len(StubSlackAPI.posts) - before_posts == 1,
               f"posts={len(StubSlackAPI.posts) - before_posts}")
         check("metadata run does not use the slackcli send path",
-              count_lines(sends_log) == 1,
+              count_lines(sends_log) == 0,
               f"sends={count_lines(sends_log)}")
         if StubSlackAPI.posts:
             payload = StubSlackAPI.posts[-1]
@@ -190,6 +190,10 @@ def test_metadata_end_to_end(tmp):
                   payload.get("metadata") == {
                       "event_type": "yanayana_reply",
                       "event_payload": {"event_id": "Ev0TEST00001"}},
+                  f"metadata={payload.get('metadata')}")
+            check("explicit event_id wins: no request_id generated",
+                  "request_id" not in payload.get("metadata", {})
+                  .get("event_payload", {}),
                   f"metadata={payload.get('metadata')}")
             check("posted payload is in the right thread",
                   payload.get("channel") == CHANNEL
@@ -301,6 +305,91 @@ def test_state_key_finalizes(tmp):
         server.server_close()
 
 
+def test_fallback_state_key_gets_request_id(tmp):
+    """Fallback --state-key (channel:ts, not an Ev id): the reply
+    must still be stamped -- with an auto-generated request_id.
+
+    The 2026-11-23 fallback-key hole: a --state-key that is not
+    Ev-form used to send unstamped (no --event-id, no stamp at
+    all), invisible to reconcile detection and re-entry blocking.
+    The wrapper now auto-generates a UUID request_id for any send
+    without an originating event, so the stamp carries the nonce
+    and the ledger keeps it. The generated id must be a valid UUID
+    and differ between independent sends.
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StubSlackAPI)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        StubSlackAPI.posts = []
+        StubSlackAPI.reads = []
+        store = os.path.join(tmp, "store.json")
+        with open(store, "w", encoding="utf-8") as f:
+            json.dump({"workspaces": {"muse-board": {"token": "fake-test-token"}},
+                       "default_workspace": "muse-board"}, f)
+        env_extra = {
+            "SLACK_API_BASE": f"http://127.0.0.1:{port}/api",
+            "POST_METADATA_STORE": store,
+        }
+        import uuid as _uuid
+        sends_log = os.path.join(tmp, "events", "fake_sends.log")
+        replied = os.path.join(tmp, "events", "replied.jsonl")
+        before_posts = len(StubSlackAPI.posts)
+        before_replied = count_lines(replied)
+        r = run_wrapper(tmp, target="8000.000000",
+                        message="fallback key reply",
+                        extra=["--state-key", f"{CHANNEL}:8000.000000"],
+                        env_extra=env_extra)
+        check("fallback-key run exits 0",
+              r.returncode == 0,
+              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:200]}")
+        check("fallback-key run posts exactly once via the API",
+              len(StubSlackAPI.posts) - before_posts == 1
+              and count_lines(sends_log) == 0,
+              f"posts={len(StubSlackAPI.posts) - before_posts}")
+        request_id = None
+        if StubSlackAPI.posts:
+            meta = StubSlackAPI.posts[-1].get("metadata") or {}
+            payload = meta.get("event_payload") or {}
+            request_id = payload.get("request_id")
+            check("fallback-key stamp carries a request_id, not an event_id",
+                  meta.get("event_type") == "yanayana_reply"
+                  and request_id is not None
+                  and "event_id" not in payload,
+                  f"metadata={meta}")
+            try:
+                _uuid.UUID(str(request_id))
+                valid_uuid = True
+            except Exception:
+                valid_uuid = False
+            check("auto-generated request_id is a valid UUID",
+                  valid_uuid, f"request_id={request_id}")
+        with open(replied, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        new_rows = rows[before_replied:]
+        check("fallback-key reply is recorded with its request_id",
+              len(new_rows) == 1
+              and new_rows[0].get("request_id") == request_id,
+              f"rows={new_rows}")
+        # A second, independent fallback-key send gets a different id.
+        r2 = run_wrapper(tmp, target="8100.000000",
+                         message="fallback key reply two",
+                         extra=["--state-key", f"{CHANNEL}:8100.000000"],
+                         env_extra=env_extra)
+        second_id = None
+        if len(StubSlackAPI.posts) - before_posts == 2:
+            payload2 = (StubSlackAPI.posts[-1].get("metadata") or {}).get("event_payload") or {}
+            second_id = payload2.get("request_id")
+        check("second fallback-key send gets a different request_id",
+              r2.returncode == 0 and second_id is not None
+              and second_id != request_id,
+              f"rc={r2.returncode} first={request_id} second={second_id}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     tmp = setup_tmp()
     try:
@@ -308,18 +397,41 @@ def main():
         replies = os.path.join(tmp, "events", "replies.jsonl")
         replied = os.path.join(tmp, "events", "replied.jsonl")
 
+        # The stub Slack API serves the whole run now: since the
+        # 2026-11-23 fallback-key fix every send through the wrapper
+        # is stamped (event_id or auto-generated request_id), so even
+        # the bare runs below go through the post_metadata path and
+        # need a token + API. The fake slackcli send path is no
+        # longer used by the wrapper; "exactly once" is counted in
+        # StubSlackAPI.posts instead of the fake sends log.
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StubSlackAPI)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        StubSlackAPI.posts = []
+        StubSlackAPI.reads = []
+        store = os.path.join(tmp, "store.json")
+        with open(store, "w", encoding="utf-8") as f:
+            json.dump({"workspaces": {"muse-board": {"token": "fake-test-token"}},
+                       "default_workspace": "muse-board"}, f)
+        env_extra = {
+            "SLACK_API_BASE": f"http://127.0.0.1:{port}/api",
+            "POST_METADATA_STORE": store,
+        }
+
         # 1. Two concurrent runs for the same target: exactly one send.
         results = []
         def _run():
-            results.append(run_wrapper(tmp))
+            results.append(run_wrapper(tmp, env_extra=env_extra))
         t1 = threading.Thread(target=_run)
         t2 = threading.Thread(target=_run)
         t1.start(); t2.start(); t1.join(); t2.join()
         check("concurrent runs both exit 0",
               all(r.returncode == 0 for r in results),
               "; ".join(f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()[:100]}" for r in results))
-        check("concurrent runs send exactly once", count_lines(sends_log) == 1,
-              f"sends={count_lines(sends_log)}")
+        check("concurrent runs send exactly once",
+              len(StubSlackAPI.posts) == 1 and count_lines(sends_log) == 0,
+              f"posts={len(StubSlackAPI.posts)} sends={count_lines(sends_log)}")
         check("replies.jsonl has exactly one entry", count_lines(replies) == 1)
         check("replied.jsonl has exactly one entry", count_lines(replied) == 1)
         if count_lines(replies) == 1 and count_lines(replied) == 1:
@@ -331,17 +443,18 @@ def main():
                   a.get("sent_ts") == b.get("reply_ts") and a.get("target_ts") == TARGET_TS)
 
         # 2. Re-run for the same target: already-replied, no new send.
-        r = run_wrapper(tmp)
+        r = run_wrapper(tmp, env_extra=env_extra)
         check("re-run exits 0 without sending",
               r.returncode == 0 and "already-replied" in r.stdout
-              and count_lines(sends_log) == 1,
+              and len(StubSlackAPI.posts) == 1,
               f"rc={r.returncode} out={r.stdout.strip()}")
 
         # 3. Dry-run for a fresh target: no send.
-        r = run_wrapper(tmp, target="3000.000000", extra=["--dry-run"])
+        r = run_wrapper(tmp, target="3000.000000", extra=["--dry-run"],
+                        env_extra=env_extra)
         check("dry-run exits 0 without sending",
               r.returncode == 0 and "would-send" in r.stdout
-              and count_lines(sends_log) == 1,
+              and len(StubSlackAPI.posts) == 1,
               f"rc={r.returncode} out={r.stdout.strip()}")
 
         # 4. replylog already FOUND blocks the send before reply_once.
@@ -349,10 +462,10 @@ def main():
             f.write(json.dumps({"channel": CHANNEL, "target_ts": "4000.000000",
                                 "sent_ts": "4000.000001",
                                 "thread_ts": THREAD_TS}) + "\n")
-        r = run_wrapper(tmp, target="4000.000000")
+        r = run_wrapper(tmp, target="4000.000000", env_extra=env_extra)
         check("pre-seeded replylog entry blocks send",
               r.returncode == 0 and "already-replied (replylog)" in r.stdout
-              and count_lines(sends_log) == 1,
+              and len(StubSlackAPI.posts) == 1,
               f"rc={r.returncode} out={r.stdout.strip()}")
 
         # 5. Metadata path end to end (stub Slack API).
@@ -360,7 +473,12 @@ def main():
 
         # 6. --state-key finalizes msgstate inside the wrapper.
         test_state_key_finalizes(tmp)
+
+        # 7. Fallback --state-key gets an auto-generated request_id.
+        test_fallback_state_key_gets_request_id(tmp)
     finally:
+        server.shutdown()
+        server.server_close()
         shutil.rmtree(tmp, ignore_errors=True)
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")

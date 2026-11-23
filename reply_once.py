@@ -23,8 +23,18 @@ of slackcli. Text matching stays as the second check, so a reply
 sent before the stamp existed is still caught. When the metadata
 read fails, the check falls back to the text check -- which stays
 fail-closed on its own read failure -- rather than blocking a
-reply the text check can verify. Without --event-id (manual posts
-with no originating event) the behaviour is unchanged.
+reply the text check can verify. Without --event-id the send is
+stamped with an auto-generated request_id instead (2026-11-23,
+three-way "event_id必須＋request_id自動生成" agreement), and the
+text check is unchanged -- a request_id stamp carries no event_id,
+so it stays a plain text candidate (see stamped_texts).
+Request-id stamping (added 2026-11-23, the fallback-key hole fix):
+with --request-id instead of --event-id the same metadata stamp
+carries the auto-generated nonce (event_payload.request_id), and
+the metadata-first duplicate check matches on it. When neither id
+is given, main() generates a request_id before sending, so no
+reply through either CLI entry point goes out unstamped; only a
+direct send() call with neither id keeps the legacy slackcli path.
 
 Stamp guard (added 2026-11-15, from Neiro's correction in
 #slack-へようこそ): the text check reads the thread with
@@ -101,8 +111,14 @@ Usage:
   reply_once.py --channel C0... --thread-ts T... --target-ts M...
       --event-id Ev... --message "..."
     # event-driven reply: metadata-stamped send (post_metadata.py)
-    # and metadata-first duplicate check; without --event-id the
-    # slackcli send and text-only check are used (manual posts)
+    # and metadata-first duplicate check; without --event-id a
+    # request_id is auto-generated and stamped instead, so no
+    # reply ever goes out unstamped (2026-11-23)
+  reply_once.py --channel C0... --thread-ts T... --target-ts M...
+      --request-id <UUID> --message "..."
+    # no originating event: same metadata stamp, carrying the
+    # request_id nonce instead (send_reply_locked.py auto-generates
+    # one, so no send through the locked path goes out unstamped)
 
 Exit codes: 0 = sent, already replied (no-op), or check completed;
 1 = usage error; 2 = send failed / thread could not be read and no
@@ -125,6 +141,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -533,7 +550,7 @@ def _append_jsonl(path, record):
 
 
 def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False,
-                 message=None, event_id=None):
+                 message=None, event_id=None, request_id=None):
     # The sent text is stored (added 2026-11-14, answering Yama's
     # question in #slack-へようこそ): until now the record kept only
     # ts values, so a later incident could only be reconstructed from
@@ -559,6 +576,14 @@ def record_reply(channel, thread_ts, target_ts, reply_ts, recovered=False,
         entry["text"] = message
     if event_id is not None:
         entry["event_id"] = event_id
+    if request_id is not None:
+        # The auto-generated request_id stamp (2026-11-23, the
+        # fallback-key hole fix): a reply sent without an originating
+        # event is stamped with a request_id instead of going out
+        # unstamped, and the ledger keeps the mark so a later reader
+        # can tell which stamp proves this reply -- the same "keep
+        # the mark" principle as event_id above.
+        entry["request_id"] = request_id
     _append_jsonl(REPLIED, entry)
 
 
@@ -651,7 +676,7 @@ def close_no_text(channel, thread_ts, target_ts):
 
 
 def record_ambiguous(channel, thread_ts, target_ts, reason, message=None,
-                     event_id=None):
+                     event_id=None, request_id=None):
     # The message text is stored so a later periodic reconciliation
     # (reconcile_ambiguous.py, adopted 2026-11-12 from Yama's share)
     # can match the entry against the live thread by exact text.
@@ -672,23 +697,29 @@ def record_ambiguous(channel, thread_ts, target_ts, reason, message=None,
         entry["message"] = message
     if event_id is not None:
         entry["event_id"] = event_id
+    if request_id is not None:
+        entry["request_id"] = request_id
     _append_jsonl(AMBIGUOUS, entry)
 
 
-def metadata_reply_found(channel, thread_ts, event_id):
+def metadata_reply_found(channel, thread_ts, event_id=None, request_id=None):
     """Ts of our metadata-stamped reply for this event, else None.
 
     Reads the thread with include_all_metadata and matches our
-    yanayana_reply stamp (post_metadata.find_reply). Raises
-    RuntimeError when the token cannot be resolved or the read
-    fails -- the caller treats that as "metadata check unavailable",
-    not as "not replied", and falls back to the text check.
+    yanayana_reply stamp (post_metadata.find_reply). Exactly one of
+    event_id / request_id: an event-driven reply is matched by its
+    originating event_id, a request_id-stamped reply by its
+    auto-generated nonce. Raises RuntimeError when the token cannot
+    be resolved or the read fails -- the caller treats that as
+    "metadata check unavailable", not as "not replied", and falls
+    back to the text check.
     """
     token = post_metadata.resolve_token()
     if not token:
         raise RuntimeError("metadata check: token not found")
     found = post_metadata.find_reply(channel, thread_ts, token,
-                                     event_id=event_id)
+                                     event_id=event_id,
+                                     request_id=request_id)
     return found.get("ts") if found else None
 
 
@@ -730,7 +761,7 @@ def stamped_texts(channel, thread_ts, event_id, since_ts=None):
 
 
 def already_replied(channel, thread_ts, target_ts=None, message=None,
-                    event_id=None):
+                    event_id=None, request_id=None):
     try:
         if target_ts:
             if in_record_for_target(target_ts):
@@ -743,15 +774,20 @@ def already_replied(channel, thread_ts, target_ts=None, message=None,
         print(f"warning: record check failed ({e}); cannot verify",
               file=sys.stderr)
         return "unknown"
-    if event_id:
+    if event_id or request_id:
         # Metadata first: a stamp proves this event was answered
         # even when the reply text differs from the draft (e.g. a
         # retry with edited wording). A failed metadata read falls
         # back to the text check below, which stays fail-closed on
         # its own read failure -- the metadata check is an extra
         # proof channel, not a new single point of failure.
+        # A request_id stamp has no event_id, so stamped_texts
+        # (event_id-only) cannot exclude it; it stays a plain text
+        # candidate below, like any manual post's reply.
         try:
-            if metadata_reply_found(channel, thread_ts, event_id):
+            if metadata_reply_found(channel, thread_ts,
+                                    event_id=event_id,
+                                    request_id=request_id):
                 return "thread"
         except Exception as e:
             print(f"warning: metadata check failed ({e}); falling back "
@@ -802,19 +838,26 @@ def already_replied(channel, thread_ts, target_ts=None, message=None,
     return None
 
 
-def send(channel, thread_ts, message, event_id=None):
+def send(channel, thread_ts, message, event_id=None, request_id=None):
     """Send one thread reply; returns the sent message's ts.
 
     With event_id the reply is stamped with metadata (event_type
     "yanayana_reply", event_payload.event_id = the originating Slack
     event_id) via post_metadata.py, so a later run can match it by
-    stamp. Without one (manual posts, no originating event) the
-    slackcli path is used as before. Raises RuntimeError on failure
-    so the caller runs its lost-response recovery check.
+    stamp. With request_id (no originating event: a fallback-key or
+    manual send) the same stamp carries the auto-generated nonce
+    instead -- the 2026-11-23 fallback-key hole fix: no send through
+    this path goes out unstamped any more. With neither id the
+    legacy slackcli path is used (direct send() callers only; both
+    CLI entry points auto-generate a request_id first, so they never
+    reach this branch).
+    Raises RuntimeError on failure so the caller runs its
+    lost-response recovery check.
     """
-    if event_id:
+    if event_id or request_id:
         ok, result = post_metadata.send_reply(channel, thread_ts,
-                                              message, event_id=event_id)
+                                              message, event_id=event_id,
+                                              request_id=request_id)
         if not ok:
             raise RuntimeError(f"post_metadata send failed: {result}")
         return result.get("ts") or result.get("message", {}).get("ts")
@@ -831,7 +874,7 @@ def send(channel, thread_ts, message, event_id=None):
 
 
 def main(argv):
-    channel = thread_ts = message = target_ts = event_id = None
+    channel = thread_ts = message = target_ts = event_id = request_id = None
     check_only = False
     i = 0
     while i < len(argv):
@@ -844,6 +887,8 @@ def main(argv):
             target_ts = argv[i + 1]; i += 2
         elif a == "--event-id" and i + 1 < len(argv):
             event_id = argv[i + 1]; i += 2
+        elif a == "--request-id" and i + 1 < len(argv):
+            request_id = argv[i + 1]; i += 2
         elif a == "--message" and i + 1 < len(argv):
             message = argv[i + 1]; i += 2
         elif a == "--check-only":
@@ -853,8 +898,8 @@ def main(argv):
             return 1
     if not channel or not thread_ts or (not check_only and not message):
         print("usage: reply_once.py --channel C... --thread-ts T... "
-              "[--target-ts M...] [--event-id Ev...] [--message TEXT] "
-              "[--check-only]", file=sys.stderr)
+              "[--target-ts M...] [--event-id Ev...] [--request-id UUID] "
+              "[--message TEXT] [--check-only]", file=sys.stderr)
         return 1
 
     # Window for this run's target-mode live-thread checks (the
@@ -864,7 +909,8 @@ def main(argv):
     since_ts = window_start(target_ts) if target_ts else None
 
     found = already_replied(channel, thread_ts, target_ts=target_ts,
-                            message=message, event_id=event_id)
+                            message=message, event_id=event_id,
+                            request_id=request_id)
     if found == "unknown":
         print("cannot-verify: thread read failed and no record entry; "
               "refusing to send", file=sys.stderr)
@@ -898,7 +944,8 @@ def main(argv):
                             record_reply(channel, thread_ts, target_ts,
                                          r["ts"], recovered=True,
                                          message=r["text"],
-                                         event_id=event_id)
+                                         event_id=event_id,
+                                         request_id=request_id)
                             break
                 except Exception as e:
                     print(f"warning: could not record thread-found reply ({e})",
@@ -943,9 +990,26 @@ def main(argv):
               file=sys.stderr)
         return 4
 
+    # No originating event and no caller-supplied nonce: the stamp
+    # is a request_id, so generate one here -- every send through
+    # this entry point carries a stamp (2026-11-23 three-way
+    # agreement; event_id is provenance and is never fabricated).
+    # Generated lazily, after the guards, so a refused send mints
+    # no id and the pre-send checks never see a fresh nonce (a
+    # metadata check on it could never match a previous attempt).
+    # The id is recorded with the reply, so reconcile can match the
+    # landed stamp to this send. send_reply_locked.py generates one
+    # earlier for the same reason; whichever layer mints it, exactly
+    # one stamp reaches the send.
+    if not event_id and not request_id:
+        request_id = str(uuid.uuid4())
+        print(f"note: no event_id; stamping with generated request_id "
+              f"{request_id}", file=sys.stderr)
+
     reply_ts = None
     try:
-        reply_ts = send(channel, thread_ts, message, event_id=event_id)
+        reply_ts = send(channel, thread_ts, message, event_id=event_id,
+                        request_id=request_id)
     except Exception as e:
         # The send response was lost: the reply may still have landed.
         # Confirm from the live thread before deciding anything.
@@ -955,7 +1019,8 @@ def main(argv):
                                  since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
-                         message=message, event_id=event_id)
+                         message=message, event_id=event_id,
+                         request_id=request_id)
             # The reply_ts stays in the success line (same shape as
             # the plain send below): send_reply_locked.py parses
             # "sent reply_ts=" to finalize, and the recovered shape
@@ -968,7 +1033,7 @@ def main(argv):
                   if outcome is None else
                   "send-response-lost; recovery check confirmed reply absent")
         record_ambiguous(channel, thread_ts, target_ts, reason, message,
-                         event_id=event_id)
+                         event_id=event_id, request_id=request_id)
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
@@ -980,19 +1045,20 @@ def main(argv):
                                  since_ts=since_ts)
         if outcome:
             record_reply(channel, thread_ts, target_ts, outcome, recovered=True,
-                         message=message, event_id=event_id)
+                         message=message, event_id=event_id,
+                         request_id=request_id)
             print(f"sent reply_ts={outcome} (recovered: reply found in thread, send gave no ts)")
             return 0
         reason = ("send gave no ts; recovery check could not verify delivery"
                   if outcome is None else
                   "send gave no ts; recovery check confirmed reply absent")
         record_ambiguous(channel, thread_ts, target_ts, reason, message,
-                         event_id=event_id)
+                         event_id=event_id, request_id=request_id)
         print(f"ambiguous_post_outcome: {reason}; not reposting blindly",
               file=sys.stderr)
         return 3
     record_reply(channel, thread_ts, target_ts, reply_ts, message=message,
-                 event_id=event_id)
+                 event_id=event_id, request_id=request_id)
     print(f"sent reply_ts={reply_ts}")
     return 0
 

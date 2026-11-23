@@ -54,7 +54,7 @@ def setup(tmp, name, messages):
     ro.thread_read_page_retry = lambda ch, ts, oldest=None: {
         "messages": messages, "has_more": False}
     SENT.clear()
-    ro.send = lambda ch, ts, msg, event_id=None: SENT.append(msg) or "999.9"
+    ro.send = lambda ch, ts, msg, event_id=None, request_id=None: SENT.append(msg) or "999.9"
 
 
 def args(message):

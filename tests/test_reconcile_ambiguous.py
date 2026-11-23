@@ -75,6 +75,84 @@ def setup(tmp):
     ra.ro.AMBIGUOUS = os.path.join(tmp, "events", "ambiguous_posts.jsonl")
 
 
+def _write_dead(tmp, entries):
+    os.makedirs(os.path.join(tmp, "events"), exist_ok=True)
+    with open(os.path.join(tmp, "events", "dead_letter.jsonl"), "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+
+def _dead(key, channel, ts, thread_ts):
+    return {"key": key, "at": "2026-11-23T00:00:00+00:00", "attempts": 3,
+            "last_error": "stale processing reclaimed",
+            "message": {"event_id": key, "channel": channel, "ts": ts,
+                        "thread_ts": thread_ts, "user": "U0OTHER",
+                        "text": "question", "received_at": "2026-11-23T00:00:00+00:00"}}
+
+
+def test_landed_dead(tmp):
+    """Landed-dead detection (2026-11-23, the 着地済み dead thread):
+    dead entries are split into landed (a reply ledger row proves
+    the target was answered) vs undetermined (no row); the sweep
+    alerts once per (key, verdict) and never changes state or
+    re-sends."""
+    # Rebase the msgstate paths and the alert file at the temp dir
+    # (same pattern as test_reconcile_state_heal.py's setup): the
+    # sweep reads dead_letter.jsonl and both reply ledgers through
+    # the msgstate module.
+    events = os.path.join(tmp, "events")
+    for name, filename in (("DEAD", "dead_letter.jsonl"),
+                           ("REPLIES_LEDGER", "replies.jsonl"),
+                           ("REPLIED_LEDGER", "replied.jsonl")):
+        setattr(ra.ms, name, os.path.join(events, filename))
+    ra.LANDED_DEAD_ALERTS = os.path.join(events, "landed_dead_alerts.jsonl")
+    _write_dead(tmp, [_dead("EvDEAD1", "C0TEST", "9000.000001", "9000.000000"),
+                      _dead("EvDEAD2", "C0TEST", "9000.000002", "9000.000000")])
+    # Only EvDEAD1 has a landed reply: a replied.jsonl row for its target.
+    write_replied(tmp, [{"channel": "C0TEST", "thread_ts": "9000.000000",
+                         "target_ts": "9000.000001", "reply_ts": "9000.000010",
+                         "at": "2026-11-23T00:01:00+00:00"}])
+    open(os.path.join(events, "replies.jsonl"), "w").close()
+    s = ra.reconcile_landed_dead()
+    check("landed-dead splits landed vs undetermined",
+          s["checked"] == 2 and s["landed"] == 1 and s["undetermined"] == 1,
+          str(s))
+    verdicts = {d["key"]: d["verdict"] for d in s["details"]}
+    check("landed verdict follows the ledger row",
+          verdicts == {"EvDEAD1": "landed", "EvDEAD2": "undetermined"},
+          str(verdicts))
+    alerts = read_jsonl(os.path.join(events, "landed_dead_alerts.jsonl"))
+    check("first run alerts once per dead entry",
+          s["new_alerts"] == 2 and len(alerts) == 2
+          and {a["key"] for a in alerts} == {"EvDEAD1", "EvDEAD2"}
+          and {a["verdict"] for a in alerts} == {"landed", "undetermined"},
+          str(alerts))
+    # Second run: same verdicts, no repeat alerts.
+    s2 = ra.reconcile_landed_dead()
+    check("second run repeats no alert for the same verdicts",
+          s2["new_alerts"] == 0 and s2["landed"] == 1
+          and s2["undetermined"] == 1
+          and len(read_jsonl(os.path.join(events, "landed_dead_alerts.jsonl"))) == 2,
+          str(s2))
+    # EvDEAD2 later gains a ledger row: the verdict flips to landed
+    # and alerts once under the new verdict.
+    with open(os.path.join(events, "replied.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"channel": "C0TEST", "thread_ts": "9000.000000",
+                            "target_ts": "9000.000002", "reply_ts": "9000.000011",
+                            "at": "2026-11-23T00:02:00+00:00"}) + "\n")
+    s3 = ra.reconcile_landed_dead()
+    check("verdict flip to landed alerts once under the new verdict",
+          s3["landed"] == 2 and s3["undetermined"] == 0
+          and s3["new_alerts"] == 1
+          and len(read_jsonl(os.path.join(events, "landed_dead_alerts.jsonl"))) == 3,
+          str(s3))
+    # The sweep never touches the dead file or the message state.
+    check("dead file untouched by the sweep",
+          len(read_jsonl(os.path.join(events, "dead_letter.jsonl"))) == 2)
+    check("no message state file created by the sweep",
+          not os.path.exists(os.path.join(events, "message_state.json")))
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
@@ -339,6 +417,9 @@ def main():
         entries = read_jsonl(os.path.join(tmp, "events", "ambiguous_posts.jsonl"))
         check("record_ambiguous without event_id omits the field",
               len(entries) == 2 and "event_id" not in entries[1], str(entries))
+
+        # 13. Landed-dead detection: alert-only, split buckets.
+        test_landed_dead(tmp)
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 1 if CHECKS[1] else 0

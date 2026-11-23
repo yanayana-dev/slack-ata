@@ -21,6 +21,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -106,8 +107,11 @@ class FakeMetadata:
 
     def send_reply(self, channel, thread_ts, text, event_id=None,
                    request_id=None, **kwargs):
-        self.send_calls.append({"channel": channel, "thread_ts": thread_ts,
-                                "text": text, "event_id": event_id})
+        call = {"channel": channel, "thread_ts": thread_ts,
+                "text": text, "event_id": event_id}
+        if request_id is not None:
+            call["request_id"] = request_id
+        self.send_calls.append(call)
         return self.send_result
 
 
@@ -332,6 +336,149 @@ def test_main_metadata_stamp_blocks_resend(tmp):
         restore_metadata(saved)
 
 
+def test_send_with_request_id_uses_metadata(tmp):
+    """send() with request_id goes through post_metadata.send_reply
+    carrying the nonce (not an event_id); a failed send raises so
+    the caller's recovery flow runs."""
+    fake = FakeMetadata()
+    saved = install_fake_metadata(fake)
+    try:
+        ts = ro.send("C0TEST", THREAD_TS, MSG, request_id="req-1234")
+        check("send with request_id -> metadata send returns ts",
+              ts == "3000.000001", f"ts={ts}")
+        check("send with request_id -> called with the nonce, no event_id",
+              fake.send_calls == [{"channel": "C0TEST",
+                                   "thread_ts": THREAD_TS,
+                                   "text": MSG, "event_id": None,
+                                   "request_id": "req-1234"}],
+              f"calls={fake.send_calls}")
+        fake.send_result = (False, "slack: channel_not_found")
+        try:
+            ro.send("C0TEST", THREAD_TS, MSG, request_id="req-1234")
+            raised = False
+        except RuntimeError:
+            raised = True
+        check("failed request_id send -> RuntimeError (recovery path)",
+              raised)
+    finally:
+        restore_metadata(saved)
+
+
+def test_main_with_request_id_sends_stamped_and_records(tmp):
+    """Full main() run with --request-id: metadata send carrying
+    the nonce, ledger record keeps the request_id; a second run
+    for the same target is already-replied via the record without
+    sending again."""
+    fake = FakeMetadata()
+    saved = install_fake_metadata(fake)
+    try:
+        setup(tmp, "mainreq", [parent()])
+        rc = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                      "--target-ts", TARGET_TS, "--request-id", "req-5678",
+                      "--message", MSG])
+        check("main with request_id -> exit 0 (sent)",
+              rc == 0, f"rc={rc}")
+        check("main with request_id -> one metadata send with the nonce",
+              len(fake.send_calls) == 1
+              and fake.send_calls[0].get("request_id") == "req-5678"
+              and fake.send_calls[0].get("event_id") is None,
+              f"calls={fake.send_calls}")
+        records = ro.load_record()
+        check("main with request_id -> reply recorded with the nonce",
+              len(records) == 1 and records[0].get("reply_ts") == "3000.000001"
+              and records[0].get("request_id") == "req-5678",
+              f"records={records}")
+        rc2 = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                       "--target-ts", TARGET_TS, "--request-id", "req-5678",
+                       "--message", MSG])
+        check("second run same target -> exit 0 already-replied",
+              rc2 == 0, f"rc2={rc2}")
+        check("second run -> no second send",
+              len(fake.send_calls) == 1, f"calls={len(fake.send_calls)}")
+    finally:
+        restore_metadata(saved)
+
+
+def test_main_request_id_stamp_blocks_resend(tmp):
+    """main() with --request-id: when the metadata check finds the
+    request_id stamp (record missing, e.g. crash after send before
+    record), nothing is sent."""
+    fake = FakeMetadata(stamped_ts="2010.000000")
+    saved = install_fake_metadata(fake)
+    try:
+        setup(tmp, "mainreqstamp", [parent(),
+                                    msg("2010.000000", YANAYANA, OTHER_MSG)])
+        rc = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                      "--target-ts", TARGET_TS, "--request-id", "req-9999",
+                      "--message", MSG])
+        check("request_id stamp found at main level -> exit 0, no send",
+              rc == 0 and fake.send_calls == [],
+              f"rc={rc} calls={fake.send_calls}")
+    finally:
+        restore_metadata(saved)
+
+
+def test_main_without_either_id_generates_request_id(tmp):
+    """main() with neither --event-id nor --request-id auto-generates
+    a request_id nonce and stamps the send with it, so no reply
+    through this entry point goes out unstamped; the ledger record
+    keeps the generated id."""
+    fake = FakeMetadata()
+    saved = install_fake_metadata(fake)
+    try:
+        setup(tmp, "maingen", [parent()])
+        rc = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                      "--target-ts", TARGET_TS, "--message", MSG])
+        check("main with neither id -> exit 0 (sent)",
+              rc == 0, f"rc={rc}")
+        generated = (fake.send_calls[0].get("request_id")
+                     if len(fake.send_calls) == 1 else None)
+        try:
+            valid_uuid = str(uuid.UUID(str(generated))) == str(generated)
+        except (ValueError, TypeError, AttributeError):
+            valid_uuid = False
+        check("main with neither id -> one metadata send, request_id "
+              "auto-generated as a UUID, no event_id",
+              len(fake.send_calls) == 1 and valid_uuid
+              and fake.send_calls[0].get("event_id") is None,
+              f"calls={fake.send_calls}")
+        records = ro.load_record()
+        check("main with neither id -> reply recorded with the "
+              "generated request_id",
+              len(records) == 1 and records[0].get("request_id") == generated,
+              f"records={records}")
+    finally:
+        restore_metadata(saved)
+
+
+def test_main_event_id_wins_no_request_id_generated(tmp):
+    """main() with --event-id: the event_id stamp wins and no
+    request_id is generated or recorded."""
+    fake = FakeMetadata()
+    saved = install_fake_metadata(fake)
+    try:
+        setup(tmp, "mainevwin", [parent()])
+        rc = ro.main(["--channel", "C0TEST", "--thread-ts", THREAD_TS,
+                      "--target-ts", TARGET_TS, "--event-id", EVENT_ID,
+                      "--message", MSG])
+        check("main with event_id -> exit 0 (sent)",
+              rc == 0, f"rc={rc}")
+        check("main with event_id -> send carries event_id, no "
+              "request_id generated",
+              len(fake.send_calls) == 1
+              and fake.send_calls[0].get("event_id") == EVENT_ID
+              and fake.send_calls[0].get("request_id") is None,
+              f"calls={fake.send_calls}")
+        records = ro.load_record()
+        check("main with event_id -> record keeps event_id, no "
+              "request_id",
+              len(records) == 1 and records[0].get("event_id") == EVENT_ID
+              and records[0].get("request_id") is None,
+              f"records={records}")
+    finally:
+        restore_metadata(saved)
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         test_stamp_found_blocks_different_text(tmp)
@@ -342,6 +489,11 @@ def main():
         test_send_without_event_id_uses_slackcli(tmp)
         test_main_with_event_id_sends_stamped_and_records(tmp)
         test_main_metadata_stamp_blocks_resend(tmp)
+        test_send_with_request_id_uses_metadata(tmp)
+        test_main_with_request_id_sends_stamped_and_records(tmp)
+        test_main_request_id_stamp_blocks_resend(tmp)
+        test_main_without_either_id_generates_request_id(tmp)
+        test_main_event_id_wins_no_request_id_generated(tmp)
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed")
     return 0 if CHECKS[1] == 0 else 1
 
