@@ -62,6 +62,7 @@ Usage:
   msgstate.py reconcile-done [--dry-run]  # clear stale last_error from done entries
 
 State: events/message_state.json ; dead letters: events/dead_letter.jsonl
+Rejected late marks (terminal-guard): events/mark_rejected.jsonl
 
 Concurrency (adopted 2026-11-12 from Neiro's + Yama's replies to
 Yanayana's question about double-claiming the same message):
@@ -94,6 +95,16 @@ LOCK = os.path.join(EVENTS, "message_state.lock")
 REPLIES_LEDGER = os.path.join(EVENTS, "replies.jsonl")
 REPLIED_LEDGER = os.path.join(EVENTS, "replied.jsonl")
 HEAL_LOG = os.path.join(EVENTS, "state_heal.jsonl")
+# Rejected late marks (2026-11-23, promised in #slack-へようこそ thread
+# 1795420153.646849): _mark_locked terminal-guards done/dead, but the
+# rejection path used to return silently -- a late write left no trace
+# at all. Every rejection now appends one structured line here
+# (timestamp, key, attempted transition, current state, reason) so the
+# daily summary / a later audit can count how often late writes race
+# a terminal state. Append-only, never deduped: each rejection is a
+# distinct event. The log write is fail-open (see
+# _log_mark_rejected): state integrity matters more than the log.
+MARK_REJECTED_LOG = os.path.join(EVENTS, "mark_rejected.jsonl")
 # Skipped-row counts for the inbox file (adopted 2026-11-12 from Neiro's
 # suggestion in #slack-へようこそ): read_inbox() skips blank and
 # malformed rows silently, but the *count* of skipped rows is kept here
@@ -655,12 +666,42 @@ def cmd_mark(argv):
         return _mark_locked(key, status, error)
 
 
+def _log_mark_rejected(key, attempted_status, current_status, reason):
+    """Record a terminal-guard rejection of a mark write.
+
+    One JSON line per rejection in events/mark_rejected.jsonl:
+    {"at", "key", "attempted_status", "current_status", "reason"}.
+    Fail-open by design: a logging failure (read-only events dir,
+    disk full, ...) must never break the mark operation itself --
+    the rejection already happened and the state file is untouched
+    either way. Never raises.
+    """
+    try:
+        os.makedirs(EVENTS, exist_ok=True)
+        rec = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "key": key,
+            "attempted_status": attempted_status,
+            "current_status": current_status,
+            "reason": reason,
+        }
+        with open(MARK_REJECTED_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        return False
+    return True
+
+
 def _mark_locked(key, status, error):
     state = load_state()
     st = state.get(key) or {"status": "pending", "attempts": 0}
     if st.get("status") == "dead":
         # Dead is terminal: later marks (e.g. a failed call racing the
         # dead-lettering processing call) must not resurrect the message.
+        # The rejection is logged (2026-11-23): a silent return left
+        # no trace that a late write had raced the terminal state.
+        _log_mark_rejected(key, status, "dead",
+                           "terminal state dead: late mark rejected")
         print("dead")
         return 0
     if st.get("status") == "done" and status != "done":
@@ -672,7 +713,10 @@ def _mark_locked(key, status, error):
         # it back to PENDING); our dead guard already existed and
         # done gets the same treatment. No legitimate flow marks a
         # done message anything but done -- pending_items never hands
-        # out a message any of whose copies is done.
+        # out a message any of whose copies is done. The rejection
+        # is logged, same as the dead guard above.
+        _log_mark_rejected(key, status, "done",
+                           "terminal state done: late mark rejected")
         print("done")
         return 0
     now = datetime.now(timezone.utc).isoformat()

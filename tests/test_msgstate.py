@@ -478,6 +478,81 @@ def main():
     check("デッドレターに総時間超過の理由が残る",
           "claim lifetime exceeded" in (dead_letters(base20)[0].get("last_error") or ""))
 
+    # 17. 終端ガードでの却下は events/mark_rejected.jsonl に警告を残す
+    # (2026-11-23, #slack-へようこそ thread 1795420153.646849 での約束)。
+    # done/dead への遅れた mark は従来サイレントに返るだけで、遅れた
+    # 書き込みが終端状態と競合した痕跡がどこにも残らなかった。
+    def mark_rejected(base):
+        path = os.path.join(base, "events", "mark_rejected.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    base21 = make_base([msg("EvR1", "1794478306.000061")])
+    check("通常の遷移では却下ログは作られない",
+          mark_rejected(base21) == []
+          and mark(base21, "EvR1", "processing") == "processing"
+          and mark_rejected(base21) == []
+          and mark(base21, "EvR1", "failed", "boom") == "failed"
+          and mark_rejected(base21) == []
+          and mark(base21, "EvR1", "done") == "done"
+          and mark_rejected(base21) == [])
+    check("doneへの遅れたmarkはdoneを返す",
+          mark(base21, "EvR1", "processing") == "done")
+    rej = mark_rejected(base21)
+    check("doneへの遅れたmarkは却下ログがちょうど1行",
+          len(rej) == 1, f"got {rej}")
+    check("却下ログに時刻・キー・遷移・現状態・理由が残る",
+          rej and rej[0]["key"] == "EvR1"
+          and rej[0]["attempted_status"] == "processing"
+          and rej[0]["current_status"] == "done"
+          and "terminal state done" in (rej[0].get("reason") or "")
+          and rej[0].get("at"), f"got {rej}")
+    check("doneへの遅れたmarkは状態を変えない",
+          state(base21)["EvR1"]["status"] == "done")
+    check("doneへの再doneは却下ではなく通常遷移（ログは増えない）",
+          mark(base21, "EvR1", "done") == "done"
+          and len(mark_rejected(base21)) == 1)
+
+    base22 = make_base([msg("EvR2", "1794478306.000062")])
+    mark(base22, "EvR2", "processing")  # attempts 1
+    mark(base22, "EvR2", "failed", "x")
+    mark(base22, "EvR2", "processing")  # attempts 2
+    mark(base22, "EvR2", "failed", "y")
+    mark(base22, "EvR2", "processing")  # attempts 3
+    mark(base22, "EvR2", "processing")  # attempts 4 > MAX -> dead
+    check("dead化自体は却下ログを作らない",
+          mark_rejected(base22) == [])
+    check("deadへの遅れたmarkはdeadを返す",
+          mark(base22, "EvR2", "done") == "dead")
+    rej = mark_rejected(base22)
+    check("deadへの遅れたmarkは却下ログがちょうど1行",
+          len(rej) == 1, f"got {rej}")
+    check("deadの却下ログに現状態deadが残る",
+          rej and rej[0]["key"] == "EvR2"
+          and rej[0]["attempted_status"] == "done"
+          and rej[0]["current_status"] == "dead"
+          and "terminal state dead" in (rej[0].get("reason") or ""),
+          f"got {rej}")
+    check("deadへの遅れたmarkは状態を変えない",
+          state(base22)["EvR2"]["status"] == "dead")
+    # 却下は毎回記録される（重複排除しない）
+    mark(base22, "EvR2", "failed", "late again")
+    check("2回目の却下も記録される",
+          len(mark_rejected(base22)) == 2, f"got {mark_rejected(base22)}")
+
+    # ログ書き込みが失敗してもmark自体は壊れない（fail-open）
+    base23 = make_base([msg("EvR3", "1794478306.000063")])
+    mark(base23, "EvR3", "processing")
+    mark(base23, "EvR3", "done")
+    os.makedirs(os.path.join(base23, "events", "mark_rejected.jsonl"),
+                exist_ok=True)  # ログパスをディレクトリにして書き込み不能に
+    check("ログが書けなくても却下markはdoneを返す",
+          mark(base23, "EvR3", "processing") == "done")
+    check("ログが書けなくても状態はdoneのまま",
+          state(base23)["EvR3"]["status"] == "done")
+
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
     return 0 if CHECKS[1] == 0 else 1
