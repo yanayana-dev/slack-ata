@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the watchdog.sh stall warning's ledger counts (2026-11-24).
+"""Tests for the watchdog.sh stall warning's ledger counts and the
+"worker alive" gate (2026-11-24).
 
 Neiro added "うち処理中 N件" to their stall warning the same day:
 a warning that only says "the oldest pending message is N seconds
@@ -8,6 +9,15 @@ batch". Our side mirrors it: the warning now carries the counts
 from Yanayana's own ledger -- "Yanayana側の台帳では未処理 X件・
 処理中 Y件です" -- read in one snapshot via
 `msgstate.py count-pending --json`.
+
+Neiro then fixed the false alarms themselves (commit ccc2890,
+shared 2026-11-24): processing threshold 600 -> 1800s, plus a
+3600s episode cooldown. Our analog of the threshold split: our age
+metric already excludes processing items, so instead the warning
+is gated on processing == 0 -- while any claim is live a worker is
+chewing the backlog and the warning must not fire. The cooldown
+needs no separate implementation: the flag file already warns once
+per stall episode and resets on drain.
 
 The watchdog is run sandboxed like test_watchdog_unit_failed.py:
 WATCHDOG_BASE/WATCHDOG_DST_DIR point at temp dirs with identical
@@ -185,19 +195,26 @@ def main():
            - timedelta(seconds=1200)).isoformat()
     now = datetime.now(timezone.utc).isoformat()
 
-    # 1. 古い未処理1件＋処理中1件 → 警告1回、台帳の件数つき
+    # 1. 古い未処理1件＋処理中1件 → ワーカー稼働中なので警告しない
+    # （Neiroさんの誤報の形：未処理全件を処理中のときの警告）
     e = Env()
     e.seed_inbox([msg("EvS1", "1794478306.000301", "古い未処理", old),
                   msg("EvS2", "1794478306.000302", "処理中", now)])
     e.cli_mark("EvS2", "processing")
     r = e.run_watchdog()
+    check("処理中がある間は警告しない（ワーカー稼働中）",
+          r.returncode == 0 and e.warns() == []
+          and not os.path.exists(e.stall_flag()))
+    # 処理が終わって未処理だけ残れば、次回は警告する
+    e.cli_mark("EvS2", "done")
+    r = e.run_watchdog()
     warns = e.warns()
-    check("滞留で警告が1回送られる",
+    check("処理中が0になれば滞留で警告が1回送られる",
           r.returncode == 0 and len(warns) == 1
           and os.path.exists(e.stall_flag()))
     check("警告文に台帳の未処理・処理中件数が入る",
           len(warns) == 1
-          and "Yanayana側の台帳では未処理 1件・処理中 1件です" in warns[0])
+          and "Yanayana側の台帳では未処理 1件・処理中 0件です" in warns[0])
     check("警告文に最古の滞留秒数が入る",
           len(warns) == 1 and "最古の未処理メッセージが" in warns[0])
     # 2. 同じ滞留のまま2回目は警告しない（重複抑止）

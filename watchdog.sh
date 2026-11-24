@@ -354,33 +354,59 @@ fi
 # flap must not cry wolf). Dedup is one
 # flag file: created when a warning is sent, removed when the queue
 # drains, so an unresolved stall warns once and a self-recovery resets
-# the latch (no hash state file needed). Never blocks the watchdog:
-# every step is best-effort and the script still exits 0 below.
+# the latch (no hash state file needed). That is also why Neiro's
+# episode cooldown (3600s, shared 2026-11-24, commit ccc2890) needs
+# no separate implementation here -- the flag already warns once per
+# stall episode however often the oldest item turns over. Never
+# blocks the watchdog: every step is best-effort and the script
+# still exits 0 below.
+#
+# "Worker alive" gate (adopted 2026-11-24 from Neiro's share,
+# commit ccc2890): while any claim is live (processing > 0) a worker
+# is chewing through the backlog, so the warning must not fire --
+# that was the shape of all 9 of our recent warnings, and of all of
+# Neiro's 27. This is our analog of Neiro's threshold split
+# (processing 1800s / pending 180s): our age metric already excludes
+# processing items, so there is no processing-side threshold to raise;
+# instead the pending-side warning is suppressed while work is in
+# flight. A stuck claim cannot mask the warning for long: the stale
+# sweep reclaims it within 600s without touch, or 1800s total claim
+# lifetime (MAX_CLAIM_SECS, touch loophole closed 2026-11-22),
+# after which processing drops to 0 and the warning fires -- the
+# same 10-to-30-minute detection tradeoff Neiro noted. If the
+# counts cannot be read, the gate fails open and the warning goes
+# out as before.
 STALL_FLAG=${WATCHDOG_STALL_FLAG:-$BASE/events/pending_stall.flag}
 STALL_THRESHOLD=${WATCHDOG_STALL_THRESHOLD:-900}
 STALL_CHANNEL=${WATCHDOG_STALL_CHANNEL:-C0EXAMPLE001}
 stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "")
+# Counts from Yanayana's own ledger (msgstate.py count-pending
+# --json, one snapshot): pending + in-flight. The oldest age above
+# already excludes processing items, so without these numbers a
+# warning cannot tell "worker stopped" from "busy processing a long
+# batch" -- the false-alarm confusion Neiro hit on 2026-11-24,
+# fixed on their side the same day by adding their processing
+# count ("うち処理中 N件"). Best-effort: if the counts cannot be
+# read, the warning still goes out without them rather than failing.
+stall_counts=$(python3 "$BASE/msgstate.py" count-pending --json 2>/dev/null || echo "")
+stall_pending=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pending',''))" 2>/dev/null || echo "")
+stall_processing=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('processing',''))" 2>/dev/null || echo "")
+case "$stall_pending" in ''|*[!0-9]*) stall_pending="" ;; esac
+case "$stall_processing" in ''|*[!0-9]*) stall_processing="" ;; esac
+if [ -n "$stall_pending" ] && [ -n "$stall_processing" ]; then
+  stall_counts_text="Yanayana側の台帳では未処理 ${stall_pending}件・処理中 ${stall_processing}件です。"
+else
+  stall_counts_text=""
+fi
 if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
-  if [ ! -f "$STALL_FLAG" ]; then
-    # Counts from Yanayana's own ledger (msgstate.py count-pending
-    # --json, one snapshot): pending + in-flight. The oldest age
-    # above already excludes processing items, so without these
-    # numbers a warning cannot tell "worker stopped" from "busy
-    # processing a long batch" -- the false-alarm confusion Neiro
-    # hit on 2026-11-24, fixed on their side the same day by adding
-    # their processing count ("うち処理中 N件"). Best-effort: if the
-    # counts cannot be read, the warning still goes out without
-    # them rather than failing.
-    stall_counts=$(python3 "$BASE/msgstate.py" count-pending --json 2>/dev/null || echo "")
-    stall_pending=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pending',''))" 2>/dev/null || echo "")
-    stall_processing=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('processing',''))" 2>/dev/null || echo "")
-    case "$stall_pending" in ''|*[!0-9]*) stall_pending="" ;; esac
-    case "$stall_processing" in ''|*[!0-9]*) stall_processing="" ;; esac
-    if [ -n "$stall_pending" ] && [ -n "$stall_processing" ]; then
-      stall_counts_text="Yanayana側の台帳では未処理 ${stall_pending}件・処理中 ${stall_processing}件です。"
-    else
-      stall_counts_text=""
-    fi
+  if [ -n "$stall_processing" ] && [ "$stall_processing" -gt 0 ]; then
+    # A worker is alive and working through the backlog: not a
+    # stall, do not warn. The flag is left as-is -- if this episode
+    # was already warned about, it stays one warning until the
+    # queue drains; if the worker then dies, processing drops to 0
+    # and the next run warns.
+    :
+  elif [ ! -f "$STALL_FLAG" ]; then
     stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。${stall_counts_text}フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
     if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
       mkdir -p "$(dirname "$STALL_FLAG")"
