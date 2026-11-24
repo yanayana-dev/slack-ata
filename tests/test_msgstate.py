@@ -310,8 +310,8 @@ def main():
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout)
 
-    def count_pending(base):
-        r = run(["count-pending"], base)
+    def count_pending(base, args=None):
+        r = run(["count-pending"] + (args or []), base)
         assert r.returncode == 0, r.stderr
         return int(r.stdout.strip())
 
@@ -715,6 +715,30 @@ def main():
     check("received_at が無ければ上がらない（落ちない）",
           [it["key"] for it in items] == ["EvH1", "EvH2"],
           f"got {[it['key'] for it in items]}")
+
+    # 35. count-pending --json（2026-11-24、Neiro の滞留警告の処理中件数
+    # 表示にならった watchdog 改善）：plain は従来どおり未処理数だけ、
+    # --json は未処理＋処理中を1スナップショットで返す。
+    base35 = make_base([
+        msg("EvJ1", "1794478306.000151", "未処理のまま"),
+        msg("EvJ2", "1794478306.000152", "処理中"),
+        msg("EvJ3", "1794478306.000153", "済み"),
+    ])
+    mark(base35, "EvJ2", "processing")
+    mark(base35, "EvJ3", "processing")
+    mark(base35, "EvJ3", "done")
+    check("count-pending は未処理数だけを返す（後方互換）",
+          count_pending(base35) == 1)
+    counts = json.loads(run(["count-pending", "--json"], base35).stdout.strip())
+    check("count-pending --json は未処理＋処理中を返す",
+          counts == {"pending": 1, "processing": 1}, f"got {counts}")
+    # stale な処理中は sweep で未処理に戻り、処理中には数えない
+    base36 = make_base([msg("EvK1", "1794478306.000161", "古い処理中")])
+    mark(base36, "EvK1", "processing")
+    set_stale(base36, "EvK1", 1)
+    counts = json.loads(run(["count-pending", "--json"], base36).stdout.strip())
+    check("stale 処理中は sweep 後に未処理として数える",
+          counts == {"pending": 1, "processing": 0}, f"got {counts}")
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")

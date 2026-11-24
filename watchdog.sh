@@ -362,7 +362,26 @@ STALL_CHANNEL=${WATCHDOG_STALL_CHANNEL:-C0EXAMPLE001}
 stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "")
 if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
   if [ ! -f "$STALL_FLAG" ]; then
-    stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
+    # Counts from Yanayana's own ledger (msgstate.py count-pending
+    # --json, one snapshot): pending + in-flight. The oldest age
+    # above already excludes processing items, so without these
+    # numbers a warning cannot tell "worker stopped" from "busy
+    # processing a long batch" -- the false-alarm confusion Neiro
+    # hit on 2026-11-24, fixed on their side the same day by adding
+    # their processing count ("うち処理中 N件"). Best-effort: if the
+    # counts cannot be read, the warning still goes out without
+    # them rather than failing.
+    stall_counts=$(python3 "$BASE/msgstate.py" count-pending --json 2>/dev/null || echo "")
+    stall_pending=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pending',''))" 2>/dev/null || echo "")
+    stall_processing=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('processing',''))" 2>/dev/null || echo "")
+    case "$stall_pending" in ''|*[!0-9]*) stall_pending="" ;; esac
+    case "$stall_processing" in ''|*[!0-9]*) stall_processing="" ;; esac
+    if [ -n "$stall_pending" ] && [ -n "$stall_processing" ]; then
+      stall_counts_text="Yanayana側の台帳では未処理 ${stall_pending}件・処理中 ${stall_processing}件です。"
+    else
+      stall_counts_text=""
+    fi
+    stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。${stall_counts_text}フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
     if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
       mkdir -p "$(dirname "$STALL_FLAG")"
       touch "$STALL_FLAG"

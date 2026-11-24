@@ -53,7 +53,9 @@ Usage:
                              # only within MAX_CLAIM_SECS of the
                              # claim's start; past that it prints
                              # "expired" and does not extend
-  msgstate.py count-pending  # just the number
+  msgstate.py count-pending [--json]  # pending count; --json
+                                  # also prints the processing count
+                                  # {"pending": N, "processing": M}
   msgstate.py oldest-pending-age  # seconds since the oldest pending
                                   # message arrived (empty when none)
   msgstate.py stats          # skipped-row counts for the inbox file
@@ -618,12 +620,35 @@ def cmd_touch(argv):
     return 0
 
 
-def cmd_count():
+def cmd_count(argv=None):
+    """Print the pending count, or pending+processing as JSON with --json.
+
+    Plain `count-pending` keeps printing just the pending number:
+    ~/hooks/scripts/slack-inbox.sh parses that bare number, so the
+    format must not change. With --json it prints
+    {"pending": N, "processing": M} from one snapshot (both counts
+    read after the same sweep+heal, so they agree with each other).
+    The watchdog's stall warning uses the JSON form so the warning
+    can say whether anything is actually in flight -- "worker
+    stopped" and "busy processing a long batch" used to look
+    identical (the false-alarm confusion Neiro hit on 2026-11-24,
+    fixed on their side the same day by adding their processing
+    count). Processing here means state entries with status
+    processing after the stale sweep, i.e. live claims;
+    pending_items() excludes them by design, so they are counted
+    from the state dict directly.
+    """
+    json_out = bool(argv) and "--json" in argv
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
         heal_replied_locked(state)
         n = len(pending_items(state))
+        if json_out:
+            m = sum(1 for st in state.values()
+                    if st.get("status") == "processing")
+            print(json.dumps({"pending": n, "processing": m}))
+            return
     print(n)
 
 
@@ -837,7 +862,7 @@ def main():
     if cmd == "touch":
         return cmd_touch(sys.argv[2:])
     if cmd == "count-pending":
-        cmd_count()
+        cmd_count(sys.argv[2:])
         return 0
     if cmd == "oldest-pending-age":
         cmd_oldest_pending_age()
