@@ -54,10 +54,17 @@ Usage:
                              # claim's start; past that it prints
                              # "expired" and does not extend
   msgstate.py count-pending [--json]  # pending count; --json
-                                  # also prints the processing count
-                                  # {"pending": N, "processing": M}
-  msgstate.py oldest-pending-age  # seconds since the oldest pending
-                                  # message arrived (empty when none)
+                                  # {"pending": N, "processing": M,
+                                  #  "bot_pending": B} -- B is the
+                                  # bot-authored share of pending
+                                  # (two-tier stall warning, 2026-11-25)
+  msgstate.py oldest-pending-age [--json]
+                                  # seconds since the oldest pending
+                                  # message arrived (empty when none);
+                                  # --json splits it by author kind:
+                                  # {"human": secs|null, "bot": secs|null,
+                                  #  "oldest_author_kind": "human"|"bot"|null}
+                                  # (two-tier stall warning, 2026-11-25)
   msgstate.py stats          # skipped-row counts for the inbox file
   msgstate.py mark KEY STATUS [--error TEXT]
   msgstate.py key-of         # read one inbox JSON line on stdin, print its key
@@ -164,6 +171,21 @@ AGING_TOP_SECS = 900
 DM_CHANNEL_TYPES = ("im", "mpim")
 YANAYANA_USER_ID = "U0EXAMPLEBOT"
 ATA_USER_ID = "U0EXAMPLEOWNER"
+
+
+def _author_kind(rec):
+    """"bot" or "human" for an inbox record (two-tier stall warning,
+    2026-11-25, adopted from Neiro's commit 865c873).
+
+    Neiro records author_kind at first claim because their ledger
+    has no author info; ours does not need that step -- pending_items()
+    returns the full inbox record, which carries bot_id. The
+    decision uses only the event's own marks: bot_id present means
+    bot, absent means human. Records from before bot_id was kept
+    (no mark either way) read as human, so nothing unmarked is
+    pushed to the lenient side. No IDs are hardcoded.
+    """
+    return "bot" if rec.get("bot_id") else "human"
 
 
 def _priority_tier(rec):
@@ -636,20 +658,66 @@ def cmd_count(argv=None):
     count). Processing here means state entries with status
     processing after the stale sweep, i.e. live claims;
     pending_items() excludes them by design, so they are counted
-    from the state dict directly.
+    from the state dict directly. bot_pending is the bot-authored
+    share of pending (two-tier stall warning, 2026-11-25): the
+    watchdog's sub-tier warning needs to say how many of the
+    unprocessed messages are bot chatter.
     """
     json_out = bool(argv) and "--json" in argv
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
         heal_replied_locked(state)
-        n = len(pending_items(state))
+        items = pending_items(state)
+        n = len(items)
         if json_out:
             m = sum(1 for st in state.values()
                     if st.get("status") == "processing")
-            print(json.dumps({"pending": n, "processing": m}))
+            b = sum(1 for it in items
+                    if _author_kind(it.get("message", {})) == "bot")
+            print(json.dumps({"pending": n, "processing": m,
+                              "bot_pending": b}))
             return
     print(n)
+
+
+def oldest_pending_age_by_kind(items=None, now=None):
+    """Oldest-pending age split by author kind (two-tier stall
+    warning, 2026-11-25, adopted from Neiro's commit 865c873).
+
+    Returns {"human": secs|None, "bot": secs|None,
+    "oldest_author_kind": "human"|"bot"|None}: the age of the
+    oldest pending/failed item of each kind, measured from
+    received_at like oldest_pending_age, and which kind the
+    single oldest item belongs to. Items currently being
+    processed are excluded by pending_items(), as before.
+    """
+    if items is None:
+        items = pending_items()
+    if now is None:
+        now = datetime.now(timezone.utc)
+    oldest = {"human": None, "bot": None}
+    for item in items:
+        rec = item.get("message", {})
+        received = _parse_ts(rec.get("received_at") or "")
+        if received is None:
+            continue
+        if received.tzinfo is None:
+            received = received.replace(tzinfo=timezone.utc)
+        kind = _author_kind(rec)
+        if oldest[kind] is None or received < oldest[kind]:
+            oldest[kind] = received
+    out = {}
+    for kind, dt in oldest.items():
+        out[kind] = (max(0, int((now - dt).total_seconds()))
+                     if dt is not None else None)
+    overall = None
+    for kind in ("human", "bot"):
+        if oldest[kind] is not None and (overall is None
+                                         or oldest[kind] < oldest[overall]):
+            overall = kind
+    out["oldest_author_kind"] = overall
+    return out
 
 
 def oldest_pending_age(items=None, now=None):
@@ -664,31 +732,26 @@ def oldest_pending_age(items=None, now=None):
     never trips the warning; a worker that died mid-processing is
     reclaimed by the stale sweep (600s) before the age is read.
     """
-    if items is None:
-        items = pending_items()
-    if not items:
-        return None
-    if now is None:
-        now = datetime.now(timezone.utc)
-    oldest = None
-    for item in items:
-        received = _parse_ts(item.get("message", {}).get("received_at") or "")
-        if received is None:
-            continue
-        if received.tzinfo is None:
-            received = received.replace(tzinfo=timezone.utc)
-        if oldest is None or received < oldest:
-            oldest = received
-    if oldest is None:
-        return None
-    return max(0, int((now - oldest).total_seconds()))
+    ages = oldest_pending_age_by_kind(items, now)
+    vals = [v for v in (ages["human"], ages["bot"]) if v is not None]
+    return max(vals) if vals else None
 
 
-def cmd_oldest_pending_age():
+def cmd_oldest_pending_age(argv=None):
+    """Bare form prints the single oldest age (empty when none),
+    as before. --json prints the per-kind split from
+    oldest_pending_age_by_kind (two-tier stall warning,
+    2026-11-25)."""
+    json_out = bool(argv) and "--json" in argv
     with state_lock(exclusive=True):
         state = load_state()
         sweep_stale_locked(state)
         heal_replied_locked(state)
+        if json_out:
+            print(json.dumps(
+                oldest_pending_age_by_kind(pending_items(state)),
+                ensure_ascii=False))
+            return
         age = oldest_pending_age(pending_items(state))
     print(age if age is not None else "")
 
@@ -865,7 +928,7 @@ def main():
         cmd_count(sys.argv[2:])
         return 0
     if cmd == "oldest-pending-age":
-        cmd_oldest_pending_age()
+        cmd_oldest_pending_age(sys.argv[2:])
         return 0
     if cmd == "stats":
         cmd_stats()

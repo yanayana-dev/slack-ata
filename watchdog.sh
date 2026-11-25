@@ -395,25 +395,50 @@ fi
 # blocks the watchdog: every step is best-effort and the script
 # still exits 0 below.
 #
-# "Worker alive" gate (adopted 2026-11-24 from Neiro's share,
-# commit ccc2890): while any claim is live (processing > 0) a worker
-# is chewing through the backlog, so the warning must not fire --
-# that was the shape of all 9 of our recent warnings, and of all of
-# Neiro's 27. This is our analog of Neiro's threshold split
-# (processing 1800s / pending 180s): our age metric already excludes
-# processing items, so there is no processing-side threshold to raise;
-# instead the pending-side warning is suppressed while work is in
-# flight. A stuck claim cannot mask the warning for long: the stale
-# sweep reclaims it within 600s without touch, or 1800s total claim
+# Two-tier thresholds (adopted 2026-11-25 from Neiro's share in
+# #slack-へようこそ, commit 865c873, their "Yama方式の取り入れ第2件"):
+# the oldest pending age is split by author kind -- human posts
+# warn at the main threshold (900s, unchanged), bot-to-bot posts
+# only at 10x that (9000s, Neiro's pending ratio: their 180s ->
+# 1800s). When both tiers are over, only the main warning goes out,
+# on the oldest human message; the sub warning fires only for a
+# bot-only backlog. Each tier has its own flag file, so a sub
+# warning never consumes the main tier's one-warning-per-episode
+# latch (the 3600s episode cooldown stays unnecessary here for the
+# same reason as before: each flag warns once per stall episode
+# and resets on drain). One deliberate difference from Neiro's:
+# no author_kind is recorded at claim time -- our msgstate pending
+# list already returns the full inbox record, which carries bot_id,
+# so the kind is derived at read time (bot_id present = bot, else
+# human; unmarked old records read as human, never the lenient
+# side). The processing-side thresholds need no split either: our
+# age metric already excludes processing items, and the worker-alive
+# gate below suppresses both tiers while a claim is live (adopted
+# 2026-11-24 from Neiro's share, commit ccc2890 -- that was the
+# shape of all 9 of our recent warnings, and of all of Neiro's 27).
+# A stuck claim cannot mask the warning for long: the stale sweep
+# reclaims it within 600s without touch, or 1800s total claim
 # lifetime (MAX_CLAIM_SECS, touch loophole closed 2026-11-22),
-# after which processing drops to 0 and the warning fires -- the
-# same 10-to-30-minute detection tradeoff Neiro noted. If the
-# counts cannot be read, the gate fails open and the warning goes
-# out as before.
+# after which processing drops to 0 and the warning fires.
 STALL_FLAG=${WATCHDOG_STALL_FLAG:-$BASE/events/pending_stall.flag}
+STALL_BOT_FLAG=${WATCHDOG_STALL_BOT_FLAG:-$BASE/events/pending_stall_bot.flag}
 STALL_THRESHOLD=${WATCHDOG_STALL_THRESHOLD:-900}
+# Sub tier defaults to 10x the main threshold (Neiro's pending
+# ratio) and tracks a test override of the main value, so a test
+# that sets WATCHDOG_STALL_THRESHOLD=10 gets a 100s sub tier
+# without a second override. Set WATCHDOG_STALL_BOT_THRESHOLD
+# explicitly to break the ratio.
+STALL_BOT_THRESHOLD=${WATCHDOG_STALL_BOT_THRESHOLD:-$((STALL_THRESHOLD * 10))}
 STALL_CHANNEL=${WATCHDOG_STALL_CHANNEL:-C0EXAMPLE001}
-stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "")
+# Per-kind oldest ages, one snapshot (msgstate.py
+# oldest-pending-age --json): {"human": secs|null, "bot": secs|null,
+# "oldest_author_kind": ...}. Unreadable output leaves both empty
+# and both tiers inactive, so the flags drain as before.
+stall_ages=$(python3 "$BASE/msgstate.py" oldest-pending-age --json 2>/dev/null || echo "")
+stall_human_age=$(printf '%s' "$stall_ages" | python3 -c "import json,sys; v=json.load(sys.stdin).get('human'); print(v if v is not None else '')" 2>/dev/null || echo "")
+stall_bot_age=$(printf '%s' "$stall_ages" | python3 -c "import json,sys; v=json.load(sys.stdin).get('bot'); print(v if v is not None else '')" 2>/dev/null || echo "")
+case "$stall_human_age" in ''|*[!0-9]*) stall_human_age="" ;; esac
+case "$stall_bot_age" in ''|*[!0-9]*) stall_bot_age="" ;; esac
 # Counts from Yanayana's own ledger (msgstate.py count-pending
 # --json, one snapshot): pending + in-flight. The oldest age above
 # already excludes processing items, so without these numbers a
@@ -425,30 +450,63 @@ stall_age=$(python3 "$BASE/msgstate.py" oldest-pending-age 2>/dev/null || echo "
 stall_counts=$(python3 "$BASE/msgstate.py" count-pending --json 2>/dev/null || echo "")
 stall_pending=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pending',''))" 2>/dev/null || echo "")
 stall_processing=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('processing',''))" 2>/dev/null || echo "")
+stall_bot_pending=$(printf '%s' "$stall_counts" | python3 -c "import json,sys; print(json.load(sys.stdin).get('bot_pending',''))" 2>/dev/null || echo "")
 case "$stall_pending" in ''|*[!0-9]*) stall_pending="" ;; esac
 case "$stall_processing" in ''|*[!0-9]*) stall_processing="" ;; esac
+case "$stall_bot_pending" in ''|*[!0-9]*) stall_bot_pending="" ;; esac
 if [ -n "$stall_pending" ] && [ -n "$stall_processing" ]; then
   stall_counts_text="Yanayana側の台帳では未処理 ${stall_pending}件・処理中 ${stall_processing}件です。"
-else
-  stall_counts_text=""
-fi
-if [ -n "$stall_age" ] && [ "$stall_age" -ge "$STALL_THRESHOLD" ]; then
-  if [ -n "$stall_processing" ] && [ "$stall_processing" -gt 0 ]; then
-    # A worker is alive and working through the backlog: not a
-    # stall, do not warn. The flag is left as-is -- if this episode
-    # was already warned about, it stays one warning until the
-    # queue drains; if the worker then dies, processing drops to 0
-    # and the next run warns.
-    :
-  elif [ ! -f "$STALL_FLAG" ]; then
-    stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。${stall_counts_text}フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
-    if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
-      mkdir -p "$(dirname "$STALL_FLAG")"
-      touch "$STALL_FLAG"
-    fi
+  if [ -n "$stall_bot_pending" ]; then
+    stall_bot_counts_text="Yanayana側の台帳では未処理 ${stall_pending}件（うちボット ${stall_bot_pending}件）・処理中 ${stall_processing}件です。"
+  else
+    stall_bot_counts_text="$stall_counts_text"
   fi
 else
-  rm -f "$STALL_FLAG"
+  stall_counts_text=""
+  stall_bot_counts_text=""
+fi
+# Tier activity: main = oldest human pending over the main
+# threshold; sub = oldest bot pending over the sub threshold AND
+# the main tier quiet (both over -> main only, on the oldest human
+# message, as in Neiro's design).
+stall_main_active=0
+if [ -n "$stall_human_age" ] && [ "$stall_human_age" -ge "$STALL_THRESHOLD" ]; then
+  stall_main_active=1
+fi
+stall_bot_active=0
+if [ -n "$stall_bot_age" ] && [ "$stall_bot_age" -ge "$STALL_BOT_THRESHOLD" ] && [ "$stall_main_active" -eq 0 ]; then
+  stall_bot_active=1
+fi
+if [ -n "$stall_processing" ] && [ "$stall_processing" -gt 0 ]; then
+  # A worker is alive and working through the backlog: not a
+  # stall, do not warn on either tier. The flags are left as-is --
+  # if an episode was already warned about, it stays one warning
+  # until the queue drains; if the worker then dies, processing
+  # drops to 0 and the next run warns.
+  :
+else
+  if [ "$stall_main_active" -eq 1 ]; then
+    if [ ! -f "$STALL_FLAG" ]; then
+      stall_msg="【未処理の滞留】最古の未処理メッセージが ${stall_human_age} 秒以上処理されていません（しきい値 ${STALL_THRESHOLD} 秒）。${stall_counts_text}フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
+      if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$STALL_FLAG")"
+        touch "$STALL_FLAG"
+      fi
+    fi
+  else
+    rm -f "$STALL_FLAG"
+  fi
+  if [ "$stall_bot_active" -eq 1 ]; then
+    if [ ! -f "$STALL_BOT_FLAG" ]; then
+      stall_msg="【未処理の滞留】ボット同士の未処理投稿です（副の長めのしきい値での警告）。最古の未処理メッセージが ${stall_bot_age} 秒以上処理されていません（しきい値 ${STALL_BOT_THRESHOLD} 秒）。${stall_bot_counts_text}フックまたは処理役が止まっている可能性があります。リスナーの再起動では直らなかった滞留です。確認してください。"
+      if timeout 30 "$BASE/bin/slackcli" messages send --recipient-id "$STALL_CHANNEL" --message "$stall_msg" --json >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$STALL_BOT_FLAG")"
+        touch "$STALL_BOT_FLAG"
+      fi
+    fi
+  else
+    rm -f "$STALL_BOT_FLAG"
+  fi
 fi
 
 # Unit-failure warnings (Neiro's design, adopted 2026-11-19, thread

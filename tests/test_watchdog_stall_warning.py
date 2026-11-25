@@ -93,11 +93,14 @@ UNITS = [
 ]
 
 
-def msg(event_id, ts, text, received_at):
-    return {"event_id": event_id, "received_at": received_at,
-            "channel": "C0EXAMPLE001", "channel_type": "channel",
-            "user": "U0EXAMPLEUSER", "text": text, "ts": ts,
-            "thread_ts": None}
+def msg(event_id, ts, text, received_at, bot_id=None):
+    m = {"event_id": event_id, "received_at": received_at,
+         "channel": "C0EXAMPLE001", "channel_type": "channel",
+         "user": "U0EXAMPLEUSER", "text": text, "ts": ts,
+         "thread_ts": None}
+    if bot_id is not None:
+        m["bot_id"] = bot_id
+    return m
 
 
 class Env:
@@ -172,6 +175,8 @@ class Env:
                    WATCHDOG_DST_DIR=self.dst,
                    WATCHDOG_STALL_FLAG=os.path.join(
                        self.base, "events", "stall.flag"),
+                   WATCHDOG_STALL_BOT_FLAG=os.path.join(
+                       self.base, "events", "stall_bot.flag"),
                    WATCHDOG_STALL_THRESHOLD="10",
                    WATCHDOG_STALL_CHANNEL="C0EXAMPLE111",
                    WATCHDOG_UNIT_FAIL_CHANNEL="C0EXAMPLE111",
@@ -188,6 +193,9 @@ class Env:
 
     def stall_flag(self):
         return os.path.join(self.base, "events", "stall.flag")
+
+    def stall_bot_flag(self):
+        return os.path.join(self.base, "events", "stall_bot.flag")
 
 
 def main():
@@ -238,6 +246,65 @@ def main():
     check("処理中だけでは警告しない",
           r.returncode == 0 and e.warns() == []
           and not os.path.exists(e.stall_flag()))
+    e.cleanup()
+
+    # 5. 二段構え（2026-11-25、Neiro のコミット 865c873 の取り入れ）。
+    # 副のしきい値は主の10倍（テストでは主 10秒→副 100秒）。
+    # ボットだけの未処理が副未満なら警告しない。
+    e = Env()
+    e.seed_inbox([msg("EvB1", "1794478306.000401", "ボットの未処理",
+                      (datetime.now(timezone.utc)
+                       - timedelta(seconds=60)).isoformat(),
+                      bot_id="B0EXAMPLEBOT")])
+    r = e.run_watchdog()
+    check("ボットだけの未処理が副のしきい値未満なら警告しない",
+          r.returncode == 0 and e.warns() == []
+          and not os.path.exists(e.stall_flag())
+          and not os.path.exists(e.stall_bot_flag()))
+    # 副を超えたら副の警告が1回送られ、主のフラグは立たない
+    e.seed_inbox([msg("EvB1", "1794478306.000401", "ボットの未処理",
+                      (datetime.now(timezone.utc)
+                       - timedelta(seconds=1200)).isoformat(),
+                      bot_id="B0EXAMPLEBOT")])
+    r = e.run_watchdog()
+    warns = e.warns()
+    check("ボットだけの滞留が副を超えると副の警告が1回送られる",
+          r.returncode == 0 and len(warns) == 1
+          and os.path.exists(e.stall_bot_flag())
+          and not os.path.exists(e.stall_flag()))
+    check("副の警告文にボット同士の前置きが入る",
+          len(warns) == 1
+          and "ボット同士の未処理投稿です（副の長めのしきい値での警告）" in warns[0])
+    check("副の警告文にボット分の未処理件数が入る",
+          len(warns) == 1 and "うちボット 1件" in warns[0])
+    # 6. 同じ副の滞留のまま2回目は警告しない（段別の重複抑止）
+    r = e.run_watchdog()
+    check("副の繰り返し実行では再警告しない",
+          r.returncode == 0 and len(e.warns()) == 1)
+    # 7. ボットの滞留が捌けたら副のフラグが消える
+    e.cli_mark("EvB1", "done")
+    r = e.run_watchdog()
+    check("ボットの滞留解消で副のフラグが消える",
+          r.returncode == 0 and not os.path.exists(e.stall_bot_flag())
+          and len(e.warns()) == 1)
+    e.cleanup()
+
+    # 8. 両段とも超えたら主だけ警告する（副は主の警告に吸収される）
+    e = Env()
+    very_old = (datetime.now(timezone.utc)
+                - timedelta(seconds=1500)).isoformat()
+    e.seed_inbox([msg("EvM1", "1794478306.000501", "人間の未処理", old),
+                  msg("EvB2", "1794478306.000502", "ボットの未処理",
+                      very_old, bot_id="B0EXAMPLEBOT")])
+    r = e.run_watchdog()
+    warns = e.warns()
+    check("両段超過時は主の警告だけが送られる",
+          r.returncode == 0 and len(warns) == 1
+          and os.path.exists(e.stall_flag())
+          and not os.path.exists(e.stall_bot_flag()))
+    check("両段超過時の警告文に副の前置きは入らない",
+          len(warns) == 1
+          and "ボット同士の未処理投稿です" not in warns[0])
     e.cleanup()
 
     print(f"{CHECKS[0]} passed, {CHECKS[1]} failed")

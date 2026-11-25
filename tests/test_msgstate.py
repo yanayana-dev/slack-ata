@@ -731,14 +731,66 @@ def main():
           count_pending(base35) == 1)
     counts = json.loads(run(["count-pending", "--json"], base35).stdout.strip())
     check("count-pending --json は未処理＋処理中を返す",
-          counts == {"pending": 1, "processing": 1}, f"got {counts}")
+          counts == {"pending": 1, "processing": 1, "bot_pending": 0}, f"got {counts}")
     # stale な処理中は sweep で未処理に戻り、処理中には数えない
     base36 = make_base([msg("EvK1", "1794478306.000161", "古い処理中")])
     mark(base36, "EvK1", "processing")
     set_stale(base36, "EvK1", 1)
     counts = json.loads(run(["count-pending", "--json"], base36).stdout.strip())
     check("stale 処理中は sweep 後に未処理として数える",
-          counts == {"pending": 1, "processing": 0}, f"got {counts}")
+          counts == {"pending": 1, "processing": 0, "bot_pending": 0}, f"got {counts}")
+
+    # 36. 二段構えの滞留警告（2026-11-25、Neiro のコミット 865c873
+    # の取り入れ）：oldest-pending-age --json は人・ボット別に最古の
+    # 経過秒と、全体の最古がどちらかを返す。count-pending --json は
+    # ボット分の未処理数 bot_pending を追加で返す。判定はイベント
+    # 自身の印だけ（bot_id あればボット、無ければ人間）で、IDの
+    # ハードコードはしない。素の oldest-pending-age は従来どおり
+    # 全体の最古を1数値で返す。
+    def oldest_json(base):
+        r = run(["oldest-pending-age", "--json"], base)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)
+
+    def bot_msg(event_id, seconds_ago, ts):
+        m = aged_msg(event_id, seconds_ago, ts)
+        m["bot_id"] = "B0EXAMPLEBOT"
+        return m
+
+    base37 = make_base([aged_msg("EvH", 200, "1794478306.000171"),
+                        bot_msg("EvB", 400, "1794478306.000172")])
+    ages = oldest_json(base37)
+    check("oldest --json は人・ボット別の最古を返す",
+          ages["human"] is not None and 190 <= ages["human"] <= 220
+          and ages["bot"] is not None and 390 <= ages["bot"] <= 420,
+          f"got {ages}")
+    check("oldest --json は全体の最古の種別を返す",
+          ages["oldest_author_kind"] == "bot", f"got {ages}")
+    check("素の oldest-pending-age は全体の最古を返す",
+          oldest_age(base37) is not None
+          and 390 <= oldest_age(base37) <= 420)
+    counts = json.loads(run(["count-pending", "--json"], base37).stdout.strip())
+    check("count-pending --json はボット分の未処理数を返す",
+          counts == {"pending": 2, "processing": 0, "bot_pending": 1},
+          f"got {counts}")
+    base38 = make_base([bot_msg("EvB2", 200, "1794478306.000181")])
+    ages = oldest_json(base38)
+    check("ボットだけなら人側は null・最古はボット",
+          ages == {"human": None, "bot": ages["bot"],
+                   "oldest_author_kind": "bot"}
+          and ages["bot"] is not None and 190 <= ages["bot"] <= 220,
+          f"got {ages}")
+    base39 = make_base([])
+    check("未処理が無ければ --json は全て null",
+          oldest_json(base39) == {"human": None, "bot": None,
+                                   "oldest_author_kind": None},
+          f"got {oldest_json(base39)}")
+    # 処理中のボットは滞留に数えない（人と同じ）
+    base40 = make_base([bot_msg("EvB3", 200, "1794478306.000191")])
+    mark(base40, "EvB3", "processing")
+    check("処理中のボットは --json の滞留に数えない",
+          oldest_json(base40) == {"human": None, "bot": None,
+                                   "oldest_author_kind": None})
 
     print(f"\n{CHECKS[0]} passed, {CHECKS[1]} failed, "
           f"{CHECKS[0] + CHECKS[1]} checks total")
