@@ -54,6 +54,25 @@ listener_py_ok() {
   [ -f "$BASE/listener.py" ] && python3 -m py_compile "$BASE/listener.py" 2>/dev/null
 }
 
+# Detection-time identity record (adopted 2026-11-25 from Neiro's
+# proposal in thread 1795611852.507439, observation item (5)):
+# whether the hosts/VMs are the same cannot be checked after a
+# stop, so when a stale heartbeat is confirmed, record hostname
+# and uptime on the spot. uptime's boot time is the useful half
+# here -- our hostname is the generic runtime name -- since a
+# reset uptime proves a reboot happened between detections.
+# One JSON line per detection in events/detection_identity.log;
+# best-effort only, never blocks the restart.
+DETECTION_LOG=${WATCHDOG_DETECTION_LOG:-$BASE/events/detection_identity.log}
+record_detection_identity() { # $1 = heartbeat age in seconds
+  {
+    printf '{"at": "%s", "event": "heartbeat_stale", "heartbeat_age_s": %s, "hostname": "%s", "uptime": "%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
+      "$(hostname 2>/dev/null || echo unknown)" \
+      "$(uptime 2>/dev/null | sed 's/"/'"'"'/g' || echo unknown)"
+  } >> "$DETECTION_LOG" 2>/dev/null || true
+}
+
 # Hook health check (adopted 2026-11-15 from Neiro's check-script share):
 # syntax of ~/hooks/scripts/*.sh and JSON of ~/hooks/definitions/*.json;
 # warns to Slack on new/changed failures. Never blocks the watchdog.
@@ -317,6 +336,10 @@ if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
   hb_mtime=$(stat -c %Y "$HB" 2>/dev/null || echo 0)
   age=$(( now - hb_mtime ))
   if [ "$age" -gt 120 ] || ! grep -q '"connected": true' "$HB" 2>/dev/null; then
+    # Record host identity at detection time (Neiro's proposal,
+    # thread 1795611852.507439): before any restart decision, so
+    # the record exists even when the cooldown suppresses it.
+    record_detection_identity "$age"
     # Cooldown after a successful restart (same share): the next
     # check can land while the listener is still starting up, and
     # must not fire a second restart at the same heartbeat. 60s
