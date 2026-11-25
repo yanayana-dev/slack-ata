@@ -61,15 +61,26 @@ listener_py_ok() {
 # and uptime on the spot. uptime's boot time is the useful half
 # here -- our hostname is the generic runtime name -- since a
 # reset uptime proves a reboot happened between detections.
+# Refined 2026-11-25 from Yama's follow-up in the same thread:
+# hostname can collide across VMs and uptime drifts with record
+# time, so also record the boot_id hash -- first 8 chars of
+# sha256sum of /proc/sys/kernel/random/boot_id (file bytes as-is,
+# trailing newline included) -- and the boot time (uptime -s).
+# Same kernel (same VM) => same hash; different VM => different.
 # One JSON line per detection in events/detection_identity.log;
 # best-effort only, never blocks the restart.
 DETECTION_LOG=${WATCHDOG_DETECTION_LOG:-$BASE/events/detection_identity.log}
 record_detection_identity() { # $1 = heartbeat age in seconds
+  local boot_id_hash boot_time
+  boot_id_hash=$(sha256sum /proc/sys/kernel/random/boot_id 2>/dev/null | cut -c1-8)
+  [ -n "$boot_id_hash" ] || boot_id_hash=unknown
+  boot_time=$(uptime -s 2>/dev/null || echo unknown)
   {
-    printf '{"at": "%s", "event": "heartbeat_stale", "heartbeat_age_s": %s, "hostname": "%s", "uptime": "%s"}\n' \
+    printf '{"at": "%s", "event": "heartbeat_stale", "heartbeat_age_s": %s, "hostname": "%s", "uptime": "%s", "boot_id_hash": "%s", "boot_time": "%s"}\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
       "$(hostname 2>/dev/null || echo unknown)" \
-      "$(uptime 2>/dev/null | sed 's/"/'"'"'/g' || echo unknown)"
+      "$(uptime 2>/dev/null | sed 's/"/'"'"'/g' || echo unknown)" \
+      "$boot_id_hash" "$boot_time"
   } >> "$DETECTION_LOG" 2>/dev/null || true
 }
 
