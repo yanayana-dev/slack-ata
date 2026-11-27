@@ -3,6 +3,7 @@ Description=Watchdog check for slack-listener
 
 [Service]
 Type=oneshot
+TimeoutStartSec=300
 EnvironmentFile=/path/to/slack-watcher/proxy.env
 Environment=HOME=/path/to
 # slackcli is a Bun binary: without NODE_USE_ENV_PROXY it ignores the

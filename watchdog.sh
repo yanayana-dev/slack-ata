@@ -44,6 +44,28 @@ COOLDOWN_FILE=${WATCHDOG_RESTART_COOLDOWN_FILE:-$BASE/events/watchdog_restart.co
 MAX_ATTEMPTS=3
 BACKOFF_BASE=30
 
+# Hang + overlap guard (adopted 2026-11-27 from Neiro's share,
+# commit 11d9215: timeout 240 + flock -n): the timer path and the
+# hook/cron direct calls can overlap, and a hung run must not block
+# later cycles forever. Re-exec once under `timeout 240` (the timer
+# path additionally has TimeoutStartSec=300 on the oneshot service),
+# then take a non-blocking exclusive lock; a second run exits quietly.
+if [ -z "${WATCHDOG_TIMEOUT_WRAPPED:-}" ]; then
+  # Resolve $0: `timeout` does a PATH lookup, so a relative $0
+  # (e.g. `bash watchdog.sh`) would fail with 127 on the re-exec.
+  # Run through `bash`: the script has no +x bit (callers invoke it
+  # as `bash watchdog.sh`, same as the timer and the hooks do).
+  SCRIPT_PATH="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+  WATCHDOG_TIMEOUT_WRAPPED=1 exec timeout 240 bash "$SCRIPT_PATH" "$@"
+fi
+LOCK_FILE=${WATCHDOG_LOCK_FILE:-$BASE/events/watchdog.lock}
+mkdir -p "$BASE/events" 2>/dev/null
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "watchdog: another run is active; exiting" >&2
+  exit 0
+fi
+
 # Reader-side guard (adopted 2026-11-19 from Yama's share in thread
 # 1795064369.469599): before restarting the listener, check that
 # listener.py still compiles. Python files are edited directly (not
